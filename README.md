@@ -14,12 +14,12 @@ go build -o gpth-toolkit .
 
 ## 서버 설정
 
-처음 실행하면 `~/.gpth-toolkit/settings.json`을 생성합니다. 기본값은 기존 서버 설정과 동일합니다.
+처음 실행하면 `~/.gpth-toolkit/settings.json`을 생성합니다. 기본 remote는 등록된 목록에서 직접 선택하고, 나머지 기본값은 기존 서버 설정과 동일합니다.
 
 ```json
 {
   "work_root": "/work",
-  "rclone_remote": "gdrive",
+  "rclone_remote": "",
   "server_ip": "192.168.10.115",
   "rclone_transfers": 4,
   "rclone_checkers": 8,
@@ -30,11 +30,13 @@ go build -o gpth-toolkit .
 
 `c` 메뉴에서 적용된 설정과 파일 위치를 확인합니다. 파일을 수정하고 프로그램을 다시 시작하면 적용됩니다. `GPTH_CONFIG` 환경변수로 다른 설정 파일 경로를 지정할 수 있습니다.
 
+`rclone_remote`가 없거나 비어 있으면 시작 시 `rclone listremotes`의 등록 목록에서 기본 remote를 선택합니다. 선택은 설정 파일에 저장되며 다음 실행부터 다시 묻지 않습니다. 기존에 저장된 remote는 유지합니다. 이후 변경은 `r` 메뉴에서 하며 저장 즉시 다운로드·업로드·가져오기에 공통 적용됩니다. 등록된 remote가 없으면 `rclone config`로 등록한 뒤 다시 선택하세요. 건너뛴 경우 로컬 작업은 가능하지만 Drive 작업 전에는 기본 remote를 지정해야 합니다.
+
 기본 작업 디렉터리는 `work_root` 아래의 `takeout`, `processed`, `archive`, `takeout-nfc`입니다. 필요하면 `takeout_dir`, `processed_dir`, `archive_dir`, `normalized_input_dir`에 절대 경로를 지정하세요. 각 디렉터리는 `work_root` 아래에 있어야 하고 서로 같거나 포함 관계이면 안 됩니다. 파일을 자동 이동하지 않으므로 기존 데이터 위치에 맞춰 설정해야 합니다.
 
 ## 이메일
 
-설정이 없으면 시작 시 입력하거나 건너뛸 수 있습니다. `e` 메뉴에서 설정을 입력·변경하고 `t` 메뉴에서 발송을 테스트합니다. 상세한 암호화 방식과 기존 설정 전환은 [SMTP.md](SMTP.md)를 참고하세요.
+설정이 없으면 시작 시 입력하거나 건너뛸 수 있습니다. `e` 메뉴에서 현재 설정(암호 제외)을 확인하고, 입력·수정 또는 테스트 이메일 발송을 선택합니다. 별도의 메인 `t` 메뉴는 없습니다. 상세한 암호화 방식과 기존 설정 전환은 [SMTP.md](SMTP.md)를 참고하세요.
 
 이메일을 설정하면 기존 주요 작업의 성공 알림과 함께 0–6번 메뉴의 작업 실패도 알립니다. 사용자 취소나 SMTP 테스트 실패는 실패 알림을 추가 발송하지 않습니다. SMTP 장애는 화면에 표시하며 원래 작업 오류를 덮어쓰지 않습니다. 프로세스 강제 종료·전원 장애는 이 알림 범위에 포함되지 않습니다.
 

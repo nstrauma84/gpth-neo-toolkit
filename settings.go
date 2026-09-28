@@ -29,7 +29,7 @@ type settings struct {
 }
 
 func defaultSettings() settings {
-	return settings{WorkRoot: "/work", Remote: "gdrive", ServerIP: "192.168.10.115", Transfers: 4, Checkers: 8, Streams: 4, Cutoff: "250M"}
+	return settings{WorkRoot: "/work", ServerIP: "192.168.10.115", Transfers: 4, Checkers: 8, Streams: 4, Cutoff: "250M"}
 }
 
 var settingsPath string
@@ -71,7 +71,7 @@ func decodeSettings(data []byte) (settings, error) {
 			}
 		}
 	}
-	if strings.TrimSpace(c.Remote) == "" || strings.ContainsAny(c.Remote, ":/\\\r\n\t") {
+	if c.Remote != "" && (strings.TrimSpace(c.Remote) != c.Remote || strings.ContainsAny(c.Remote, ":/\\\r\n\t")) {
 		return c, errors.New("rclone_remote에는 remote 이름만 입력하세요")
 	}
 	if net.ParseIP(c.ServerIP) == nil {
@@ -134,5 +134,5 @@ func showSettings() {
 	fmt.Println("서버 설정 파일:", settingsPath)
 	b, _ := json.MarshalIndent(activeSettings, "", "  ")
 	fmt.Println(string(b))
-	fmt.Println("설정 파일 수정 후 프로그램을 다시 시작하면 적용됩니다. SMTP 설정은 e 메뉴에서 변경하세요.")
+	fmt.Println("파일 수정은 재시작 후 적용됩니다. 기본 remote는 r 메뉴, SMTP 설정은 e 메뉴에서 변경하세요.")
 }
