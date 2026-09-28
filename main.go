@@ -102,10 +102,10 @@ func mainMenu() {
 		fmt.Println()
 		fmt.Println("1) Google Takeout ZIP 다운로드")
 		fmt.Println("2) GPTH Neo 실행")
-		fmt.Println("3) GPTH 결과 TAR + SHA256 생성")
+		fmt.Println("3) GPTH 결과 TAR + SHA256 / PAR2 생성")
 		fmt.Println("4) Google Drive로 Archive")
 		fmt.Println("5) Archive Retrieve")
-		fmt.Println("6) Archive SHA256 검증")
+		fmt.Println("6) Archive SHA256 / PAR2 검사 및 복구")
 		fmt.Println()
 		fmt.Printf("s) %s 디스크 및 파일 현황\n", workRoot)
 		fmt.Println("c) 서버 설정 확인 / 파일 위치")
@@ -843,6 +843,16 @@ func createArchive() error {
 		return errors.New("Archive 이름에는 경로 구분자, 제어문자, 와일드카드를 사용할 수 없습니다")
 	}
 	mode := selectOne([]string{"단일 TAR", "50GB 분할 TAR"}, "방식 선택: ")
+	parityPercent, err := chooseParity()
+	if err != nil {
+		return err
+	}
+	if err := archiveSpacePlan(proc, parityPercent); err != nil {
+		return err
+	}
+	if !confirm("위 예상 용량으로 Archive 생성을 진행할까요?", true) {
+		return nil
+	}
 	start := time.Now()
 	tarName := name + ".tar"
 	shaPath := filepath.Join(archiveDir, name+".sha256.txt")
@@ -850,6 +860,12 @@ func createArchive() error {
 		dst := filepath.Join(archiveDir, tarName)
 		if _, e := os.Stat(dst); e == nil && !confirm(dst+" 가 존재합니다. 덮어쓸까요?", false) {
 			return nil
+		}
+		if err := removeOldParity(name); err != nil {
+			if errors.Is(err, errCancelled) {
+				return nil
+			}
+			return err
 		}
 		fmt.Println("[1/2] TAR 생성...")
 		if err := pipeTar(dst, false); err != nil {
@@ -873,6 +889,14 @@ func createArchive() error {
 			if !confirm("기존 분할 파일을 삭제하고 다시 만들까요?", false) {
 				return nil
 			}
+		}
+		if err := removeOldParity(name); err != nil {
+			if errors.Is(err, errCancelled) {
+				return nil
+			}
+			return err
+		}
+		if len(old) > 0 {
 			for _, p := range old {
 				if err := os.Remove(p); err != nil {
 					return fmt.Errorf("분할 파일 삭제 %s: %w", p, err)
@@ -906,6 +930,11 @@ func createArchive() error {
 	}
 	fmt.Println("✔ Archive 생성 완료:", archiveDir)
 	fmt.Println("✔ SHA256:", shaPath)
+	if parityPercent > 0 {
+		if err := createParity(name, shaPath, parityPercent); err != nil {
+			return err
+		}
+	}
 	sendEmail("TAR + SHA256 생성", "성공", fmt.Sprintf("- 아카이브 파일명: %s\n- 소요 시간: %s\n- 보관 경로: %s", tarName, formatDuration(time.Since(start)), archiveDir))
 	return nil
 }
@@ -1095,7 +1124,7 @@ func navigateRemote() (string, error) {
 }
 func archiveFiles() ([]string, error) {
 	return filesMatching(archiveDir, func(s string) bool {
-		return strings.HasSuffix(s, ".tar") || strings.Contains(s, ".tar.part.") || strings.HasSuffix(s, ".sha256.txt")
+		return isArchiveFile(s)
 	})
 }
 func rcloneSelected(src, dst string, selected []string) error {
@@ -1165,7 +1194,7 @@ func retrieveArchive() error {
 	}
 	var files []string
 	for _, s := range strings.Split(out, "\n") {
-		if strings.HasSuffix(s, ".tar") || strings.Contains(s, ".tar.part.") || strings.HasSuffix(s, ".sha256.txt") {
+		if isArchiveFile(s) {
 			files = append(files, s)
 		}
 	}
@@ -1180,37 +1209,6 @@ func retrieveArchive() error {
 	}
 	fmt.Println("✔ 가져오기 완료:", archiveDir)
 	sendEmail("Archive Retrieve 다운로드", "성공", fmt.Sprintf("- 원본 위치: %s\n- 가져온 파일: %s\n- 소요 시간: %s", rp, strings.Join(sel, " "), formatDuration(time.Since(start))))
-	return nil
-}
-func verifyArchive() error {
-	fmt.Println("===== Archive SHA256 검증 =====")
-	files, listErr := filesMatching(archiveDir, func(s string) bool { return strings.HasSuffix(s, ".sha256.txt") })
-	if listErr != nil {
-		return listErr
-	}
-	if len(files) == 0 {
-		return errors.New("SHA256 파일이 없습니다")
-	}
-	f := files[selectOne(files, "검증할 SHA256 파일 선택: ")]
-	b, e := os.ReadFile(filepath.Join(archiveDir, f))
-	if e != nil {
-		return e
-	}
-	entries, e := parseChecksums(string(b))
-	if e != nil {
-		return e
-	}
-	for _, entry := range entries {
-		h, e := shaFileWithProgress(filepath.Join(archiveDir, entry.Name))
-		if e != nil {
-			return e
-		}
-		if h != entry.Hash {
-			return fmt.Errorf("%s: FAILED", entry.Name)
-		}
-		fmt.Println(entry.Name + ": OK")
-	}
-	fmt.Println("✔ Archive SHA256 검증 완료")
 	return nil
 }
 func showMacRsync() {
