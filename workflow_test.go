@@ -143,7 +143,7 @@ func TestSettingsValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.TakeoutDir != "/srv/photos/takeout" || c.Remote != "gdrive" || c.Transfers != 2 {
+	if c.TakeoutDir != "/srv/photos/takeout" || c.Remote != "" || c.Transfers != 2 {
 		t.Fatal("defaults/derived paths")
 	}
 	cases := []string{

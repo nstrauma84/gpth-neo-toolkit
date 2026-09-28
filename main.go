@@ -23,7 +23,7 @@ import (
 )
 
 var (
-	remote             = "gdrive"
+	remote             = ""
 	containerIP        = "192.168.10.115"
 	workRoot           = "/work"
 	takeoutDir         = "/work/takeout"
@@ -54,6 +54,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "설정:", err)
 		os.Exit(1)
 	}
+	initRemote()
 	initSMTP()
 	if err := ensureDirs(); err != nil {
 		fmt.Fprintln(os.Stderr, "작업 디렉터리:", err)
@@ -108,9 +109,9 @@ func mainMenu() {
 		fmt.Println()
 		fmt.Printf("s) %s 디스크 및 파일 현황\n", workRoot)
 		fmt.Println("c) 서버 설정 확인 / 파일 위치")
+		fmt.Println("r) 기본 rclone remote 변경")
 		fmt.Println("m) Mac으로 Archive 복사 명령어 보기")
 		fmt.Println("e) SMTP 이메일 알림 설정")
-		fmt.Println("t) SMTP 이메일 알림 테스트 발송")
 		fmt.Println("7) 종료")
 		fmt.Print("번호 선택: ")
 		c := readLine()
@@ -119,7 +120,7 @@ func mainMenu() {
 			return
 		}
 
-		valid := map[string]bool{"0": true, "1": true, "2": true, "3": true, "4": true, "5": true, "6": true, "s": true, "m": true, "t": true}
+		valid := map[string]bool{"0": true, "1": true, "2": true, "3": true, "4": true, "5": true, "6": true, "s": true, "m": true}
 		if valid[strings.ToLower(c)] {
 			if err := showStorageStatus(); err != nil {
 				reportTaskError(c, err)
@@ -151,9 +152,9 @@ func mainMenu() {
 		case "c":
 			showSettings()
 		case "e":
-			err = configureSMTP()
-		case "t":
-			err = testSMTP()
+			err = smtpMenu()
+		case "r":
+			err = configureRemote()
 		default:
 			fmt.Println("잘못된 번호입니다.")
 		}
@@ -391,6 +392,7 @@ func find7zip() string {
 }
 func statusLine() {
 	fmt.Printf("컨테이너 IP : %s\n", containerIP)
+	fmt.Printf("기본 remote : %s\n", remoteLabel())
 	i, l := installedVersion(), latestTag()
 	if i == "" {
 		fmt.Println("GPTH Neo    : ✘ NOT FOUND")
@@ -512,6 +514,9 @@ func downloadURL(url, dst string) error {
 }
 
 func ensureRemote() error {
+	if remote == "" {
+		return errors.New("기본 remote가 없습니다. r 메뉴에서 설정하세요")
+	}
 	if !existsCmd("rclone") {
 		return errors.New("rclone 없음")
 	}

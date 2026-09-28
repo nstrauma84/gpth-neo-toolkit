@@ -233,6 +233,47 @@ func configureSMTP() error {
 	return nil
 }
 
+func showSMTPSettings(w io.Writer) {
+	fmt.Fprintln(w, "===== 이메일 알림 설정 =====")
+	if emailConfig == nil {
+		fmt.Fprintln(w, "현재 상태: 미설정 / 알림 비활성화")
+		return
+	}
+	fmt.Fprintf(w, "SMTP 서버: %s\n발신 계정: %s\n수신 주소: %s\n암호: 저장됨 (표시하지 않음)\n", emailConfig.Server, emailConfig.User, emailConfig.To)
+}
+
+func smtpMenu() error {
+	for {
+		showSMTPSettings(os.Stdout)
+		fmt.Println("1) 설정 입력 / 수정\n2) 테스트 이메일 발송\n0) 돌아가기")
+		fmt.Print("선택 [0]: ")
+		line, err := in.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		switch strings.TrimSpace(line) {
+		case "", "0":
+			return nil
+		case "1":
+			err = configureSMTP()
+		case "2":
+			if emailConfig == nil {
+				fmt.Println("먼저 1번에서 이메일 설정을 입력하세요.")
+				continue
+			}
+			err = testSMTP()
+		default:
+			fmt.Println("잘못된 번호입니다.")
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "⚠ 이메일 설정:", err)
+		}
+	}
+}
+
 func sendEmail(task, status, details string) {
 	if emailConfig == nil {
 		return
