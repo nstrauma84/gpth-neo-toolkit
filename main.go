@@ -3,14 +3,12 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/smtp"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,12 +39,6 @@ const (
 	rcloneStreams   = "4"
 	rcloneCutoff    = "250M"
 
-	enableEmailNotify = true
-	smtpServer        = "smtp.gmail.com:465"
-	smtpUser          = "nomoreaspirin@gmail.com"
-	alertTo           = "inyourskull@gmail.com"
-	smtpCredential    = "/root/.gpth-smtp"
-
 	tmuxSession = "gpth-session"
 )
 
@@ -58,6 +50,7 @@ func main() {
 		os.Exit(1)
 	}
 	ensureDirs()
+	initSMTP()
 	mainMenu()
 }
 
@@ -106,6 +99,7 @@ func mainMenu() {
 		fmt.Println()
 		fmt.Println("s) /work 디스크 및 파일 현황")
 		fmt.Println("m) Mac으로 Archive 복사 명령어 보기")
+		fmt.Println("e) SMTP 이메일 알림 설정")
 		fmt.Println("t) SMTP 이메일 알림 테스트 발송")
 		fmt.Println("7) 종료")
 		fmt.Print("번호 선택: ")
@@ -140,6 +134,8 @@ func mainMenu() {
 			err = showWorkStatus()
 		case "m":
 			showMacRsync()
+		case "e":
+			err = configureSMTP()
 		case "t":
 			err = testSMTP()
 		default:
@@ -363,12 +359,10 @@ func statusLine() {
 	} else {
 		fmt.Println("7-Zip       : ✘ NOT FOUND")
 	}
-	if enableEmailNotify {
-		if smtpPassword() != "" {
-			fmt.Printf("SMTP 알림   : 활성화 (%s) ✔\n", alertTo)
-		} else {
-			fmt.Printf("SMTP 알림   : ⚠ 인증정보 없음 (%s)\n", smtpCredential)
-		}
+	if emailConfig != nil {
+		fmt.Printf("SMTP 알림   : 활성화 (%s) ✔\n", emailConfig.To)
+	} else {
+		fmt.Println("SMTP 알림   : 미설정 / 건너뜀 (e 메뉴에서 설정)")
 	}
 }
 func updateGPTH() error {
@@ -1104,57 +1098,5 @@ func showWorkStatus() error {
 		st, _ := os.Stat(filepath.Join(archiveDir, f))
 		fmt.Printf("  %-10s %s\n", humanBytes(st.Size()), f)
 	}
-	return nil
-}
-
-func smtpPassword() string {
-	b, e := os.ReadFile(smtpCredential)
-	if e != nil {
-		return ""
-	}
-	return strings.Join(strings.Fields(string(b)), "")
-}
-func sendEmail(task, status, details string) {
-	if !enableEmailNotify {
-		return
-	}
-	pass := smtpPassword()
-	if pass == "" {
-		fmt.Fprintln(os.Stderr, "⚠ SMTP 인증정보 없음")
-		return
-	}
-	server := strings.TrimPrefix(smtpServer, "smtps://")
-	host, _, _ := strings.Cut(server, ":")
-	conn, e := tls.Dial("tcp", server, &tls.Config{ServerName: host})
-	if e != nil {
-		fmt.Fprintln(os.Stderr, "⚠ 이메일 실패:", e)
-		return
-	}
-	defer conn.Close()
-	c, e := smtp.NewClient(conn, host)
-	if e != nil {
-		return
-	}
-	defer c.Quit()
-	if e = c.Auth(smtp.PlainAuth("", smtpUser, pass, host)); e != nil {
-		return
-	}
-	_ = c.Mail(smtpUser)
-	_ = c.Rcpt(alertTo)
-	w, e := c.Data()
-	if e != nil {
-		return
-	}
-	body := fmt.Sprintf("From: <%s>\r\nTo: <%s>\r\nSubject: [GPTH Server] %s 작업 %s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n[작업 결과 보고]\r\n- 작업 항목 : %s\r\n- 상태      : %s\r\n- 발생 시각 : %s\r\n\r\n%s\r\n", smtpUser, alertTo, task, status, task, status, time.Now().Format("2006-01-02 15:04:05"), details)
-	_, _ = w.Write([]byte(body))
-	_ = w.Close()
-}
-func testSMTP() error {
-	if smtpPassword() == "" {
-		return errors.New("SMTP 앱 비밀번호를 읽지 못했습니다")
-	}
-	fmt.Println("발신 계정 :", smtpUser, "\n수신 대상 :", alertTo, "\n전송 시도 중...")
-	sendEmail("SMTP 연결 테스트", "성공", "이 메일은 Google Photos Archive Toolkit Go 버전에서 보낸 테스트 메일입니다.")
-	fmt.Println("✔ 전송 명령 완료")
 	return nil
 }
