@@ -22,7 +22,7 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
-const (
+var (
 	remote             = "gdrive"
 	containerIP        = "192.168.10.115"
 	workRoot           = "/work"
@@ -31,14 +31,15 @@ const (
 	archiveDir         = "/work/archive"
 	normalizedInputDir = "/work/takeout-nfc"
 
-	gpthRepo = "Xentraxx/GooglePhotosTakeoutHelper_Neo"
-	gpthBin  = "/usr/local/bin/gpth"
-
 	rcloneTransfers = "4"
 	rcloneCheckers  = "8"
 	rcloneStreams   = "4"
 	rcloneCutoff    = "250M"
+)
 
+const (
+	gpthRepo    = "Xentraxx/GooglePhotosTakeoutHelper_Neo"
+	gpthBin     = "/usr/local/bin/gpth"
 	tmuxSession = "gpth-session"
 )
 
@@ -49,8 +50,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, "tmux:", err)
 		os.Exit(1)
 	}
-	ensureDirs()
+	if err := initSettings(); err != nil {
+		fmt.Fprintln(os.Stderr, "설정:", err)
+		os.Exit(1)
+	}
 	initSMTP()
+	if err := ensureDirs(); err != nil {
+		fmt.Fprintln(os.Stderr, "작업 디렉터리:", err)
+		sendEmail("작업 디렉터리 준비", "실패", err.Error())
+		os.Exit(1)
+	}
 	mainMenu()
 }
 
@@ -87,7 +96,7 @@ func mainMenu() {
 		fmt.Println("========================================")
 		fmt.Println()
 		statusLine()
-		fmt.Println("\n----------------------------------------\n")
+		fmt.Print("\n----------------------------------------\n\n")
 		fmt.Println("0) GPTH Neo 버전 확인 / 업데이트")
 		fmt.Println()
 		fmt.Println("1) Google Takeout ZIP 다운로드")
@@ -97,7 +106,8 @@ func mainMenu() {
 		fmt.Println("5) Archive Retrieve")
 		fmt.Println("6) Archive SHA256 검증")
 		fmt.Println()
-		fmt.Println("s) /work 디스크 및 파일 현황")
+		fmt.Printf("s) %s 디스크 및 파일 현황\n", workRoot)
+		fmt.Println("c) 서버 설정 확인 / 파일 위치")
 		fmt.Println("m) Mac으로 Archive 복사 명령어 보기")
 		fmt.Println("e) SMTP 이메일 알림 설정")
 		fmt.Println("t) SMTP 이메일 알림 테스트 발송")
@@ -111,7 +121,11 @@ func mainMenu() {
 
 		valid := map[string]bool{"0": true, "1": true, "2": true, "3": true, "4": true, "5": true, "6": true, "s": true, "m": true, "t": true}
 		if valid[strings.ToLower(c)] {
-			showStorageStatus()
+			if err := showStorageStatus(); err != nil {
+				reportTaskError(c, err)
+				pause()
+				continue
+			}
 		}
 
 		var err error
@@ -134,6 +148,8 @@ func mainMenu() {
 			err = showWorkStatus()
 		case "m":
 			showMacRsync()
+		case "c":
+			showSettings()
 		case "e":
 			err = configureSMTP()
 		case "t":
@@ -142,7 +158,7 @@ func mainMenu() {
 			fmt.Println("잘못된 번호입니다.")
 		}
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "✘", err)
+			reportTaskError(c, err)
 		}
 		pause()
 	}
@@ -154,22 +170,32 @@ func readLine() string {
 }
 func pause() { fmt.Print("\nEnter를 누르세요..."); _, _ = in.ReadString('\n') }
 func clear() { fmt.Print("\033[H\033[2J") }
-func ensureDirs() {
+func ensureDirs() error {
 	for _, d := range []string{takeoutDir, processedDir, archiveDir} {
-		_ = os.MkdirAll(d, 0755)
+		if err := os.MkdirAll(d, 0755); err != nil {
+			return fmt.Errorf("디렉터리 생성 %s: %w", d, err)
+		}
 	}
+	return nil
 }
 func run(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s 실행 실패: %w", name, err)
+	}
+	return nil
 }
-func output(name string, args ...string) string {
+func output(name string, args ...string) (string, error) {
 	b, err := exec.Command(name, args...).Output()
 	if err != nil {
-		return ""
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			return "", fmt.Errorf("%s 조회 실패: %w: %s", name, err, strings.TrimSpace(string(exit.Stderr)))
+		}
+		return "", fmt.Errorf("%s 조회 실패: %w", name, err)
 	}
-	return strings.TrimSpace(string(b))
+	return strings.TrimSpace(string(b)), nil
 }
 func existsCmd(name string) bool { _, err := exec.LookPath(name); return err == nil }
 func formatDuration(d time.Duration) string {
@@ -218,7 +244,13 @@ func humanBytes(n int64) string {
 func dirSize(root string) int64 {
 	var total int64
 	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err == nil && info.Mode().IsRegular() {
+		if err != nil {
+			if !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "⚠ 경로 조회 실패 (집계가 불완전할 수 있음): %v\n", err)
+			}
+			return nil
+		}
+		if info.Mode().IsRegular() {
 			total += info.Size()
 		}
 		return nil
@@ -228,7 +260,13 @@ func dirSize(root string) int64 {
 func fileCount(root string) int {
 	n := 0
 	_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
-		if err == nil && info.Mode().IsRegular() {
+		if err != nil {
+			if !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "⚠ 경로 조회 실패 (집계가 불완전할 수 있음): %v\n", err)
+			}
+			return nil
+		}
+		if info.Mode().IsRegular() {
 			n++
 		}
 		return nil
@@ -237,13 +275,17 @@ func fileCount(root string) int {
 }
 func freeBytes(path string) int64 {
 	var st syscall.Statfs_t
-	if syscall.Statfs(path, &st) != nil {
+	if err := syscall.Statfs(path, &st); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠ 여유 공간 조회 %s: %v\n", path, err)
 		return 0
 	}
 	return int64(st.Bavail) * int64(st.Bsize)
 }
-func filesMatching(dir string, pred func(string) bool) []string {
-	ents, _ := os.ReadDir(dir)
+func filesMatching(dir string, pred func(string) bool) ([]string, error) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("파일 목록 조회 %s: %w", dir, err)
+	}
 	var a []string
 	for _, e := range ents {
 		if !e.IsDir() && pred(e.Name()) {
@@ -251,9 +293,9 @@ func filesMatching(dir string, pred func(string) bool) []string {
 		}
 	}
 	sort.Strings(a)
-	return a
+	return a, nil
 }
-func zipFiles() []string {
+func zipFiles() ([]string, error) {
 	return filesMatching(takeoutDir, func(s string) bool { return strings.HasSuffix(strings.ToLower(s), ".zip") })
 }
 func sumFiles(dir string, names []string) int64 {
@@ -261,32 +303,44 @@ func sumFiles(dir string, names []string) int64 {
 	for _, f := range names {
 		if st, err := os.Stat(filepath.Join(dir, f)); err == nil {
 			n += st.Size()
+		} else {
+			fmt.Fprintf(os.Stderr, "⚠ 파일 크기 조회 %s: %v\n", f, err)
 		}
 	}
 	return n
 }
-func showStorageStatus() {
-	ensureDirs()
-	z := zipFiles()
+func showStorageStatus() error {
+	if err := ensureDirs(); err != nil {
+		return err
+	}
+	z, err := zipFiles()
+	if err != nil {
+		return err
+	}
 	fmt.Println("\n===== 현재 저장공간 / 작업 용량 =====")
 	fmt.Printf("현재 여유 공간       : %s\n", humanBytes(freeBytes(workRoot)))
-	fmt.Printf("/work 전체 사용량    : %s\n", humanBytes(dirSize(workRoot)))
+	fmt.Printf("%s 전체 사용량 : %s\n", workRoot, humanBytes(dirSize(workRoot)))
 	fmt.Printf("Takeout              : %s (ZIP %d개 / %s)\n", humanBytes(dirSize(takeoutDir)), len(z), humanBytes(sumFiles(takeoutDir, z)))
 	fmt.Printf("임시 NFC 입력        : %s\n", humanBytes(dirSize(normalizedInputDir)))
 	fmt.Printf("GPTH 처리 결과       : %s\n", humanBytes(dirSize(processedDir)))
 	fmt.Printf("Archive              : %s\n\n", humanBytes(dirSize(archiveDir)))
+	return nil
 }
 
 type release struct {
 	TagName string `json:"tag_name"`
 	Assets  []struct {
-		Name, BrowserDownloadURL string `json:"name","browser_download_url"`
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
 	} `json:"assets"`
 }
 
 func githubRelease(url string) (release, error) {
 	var r release
-	req, _ := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return r, err
+	}
 	req.Header.Set("User-Agent", "gpth-toolkit-go")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -391,8 +445,11 @@ func updateGPTH() error {
 	if url == "" {
 		return errors.New("Linux x86_64 release 파일을 찾지 못했습니다")
 	}
-	tmp, _ := os.MkdirTemp("", "gpth-update-*")
-	defer os.RemoveAll(tmp)
+	tmp, err := os.MkdirTemp("", "gpth-update-*")
+	if err != nil {
+		return err
+	}
+	defer warnCleanup(tmp, true)
 	dst := filepath.Join(tmp, "asset")
 	if err := downloadURL(url, dst); err != nil {
 		return err
@@ -403,16 +460,27 @@ func updateGPTH() error {
 			return errors.New("unzip이 필요합니다")
 		}
 		unp := filepath.Join(tmp, "unpacked")
-		_ = os.MkdirAll(unp, 0755)
+		if err := os.MkdirAll(unp, 0755); err != nil {
+			return err
+		}
 		if err := run("unzip", "-q", dst, "-d", unp); err != nil {
 			return err
 		}
-		_ = filepath.Walk(unp, func(p string, info os.FileInfo, err error) error {
-			if candidate == dst && err == nil && !info.IsDir() && strings.HasPrefix(strings.ToLower(info.Name()), "gpth") {
+		err = filepath.Walk(unp, func(p string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if candidate == dst && !info.IsDir() && strings.HasPrefix(strings.ToLower(info.Name()), "gpth") {
 				candidate = p
 			}
 			return nil
 		})
+		if err != nil {
+			return err
+		}
+		if candidate == dst {
+			return errors.New("압축 파일에서 GPTH 실행 파일을 찾지 못했습니다")
+		}
 	}
 	b, err := os.ReadFile(candidate)
 	if err != nil {
@@ -439,15 +507,19 @@ func downloadURL(url, dst string) error {
 	}
 	defer f.Close()
 	_, err = io.Copy(f, resp.Body)
-	return err
+	closeErr := f.Close()
+	return errors.Join(err, closeErr)
 }
 
 func ensureRemote() error {
 	if !existsCmd("rclone") {
 		return errors.New("rclone 없음")
 	}
-	out := output("rclone", "listremotes")
-	if !strings.Contains(out, remote+":") {
+	out, err := output("rclone", "listremotes")
+	if err != nil {
+		return err
+	}
+	if !remoteExists(out, remote) {
 		return fmt.Errorf("remote %s: 없음", remote)
 	}
 	return nil
@@ -482,8 +554,13 @@ func downloadTakeout() error {
 	if err := ensureRemote(); err != nil {
 		return err
 	}
-	ensureDirs()
-	out := output("rclone", "lsf", remote+":Takeout", "--files-only")
+	if err := ensureDirs(); err != nil {
+		return err
+	}
+	out, err := output("rclone", "lsf", remote+":Takeout", "--files-only")
+	if err != nil {
+		return err
+	}
 	var files []string
 	for _, s := range strings.Split(out, "\n") {
 		if strings.HasSuffix(strings.ToLower(strings.TrimSpace(s)), ".zip") {
@@ -504,18 +581,20 @@ func downloadTakeout() error {
 		}
 		sel = append(sel, files[i])
 	}
-	if len(zipFiles()) > 0 && !confirm("기존 파일을 유지한 채 다운로드를 계속할까요?", false) {
+	existing, err := zipFiles()
+	if err != nil {
+		return err
+	}
+	if len(existing) > 0 && !confirm("기존 파일을 유지한 채 다운로드를 계속할까요?", false) {
 		return nil
 	}
-	filter, _ := os.CreateTemp("", "takeout-filter-*")
-	defer os.Remove(filter.Name())
-	for _, s := range sel {
-		fmt.Fprintf(filter, "+ /%s\n", s)
+	filterPath, err := selectedFilter(sel)
+	if err != nil {
+		return err
 	}
-	fmt.Fprintln(filter, "- *")
-	filter.Close()
+	defer warnCleanup(filterPath, false)
 	start := time.Now()
-	err := run("rclone", "copy", remote+":Takeout", takeoutDir, "--filter-from", filter.Name(), "--progress", "--transfers="+rcloneTransfers, "--checkers="+rcloneCheckers, "--multi-thread-streams="+rcloneStreams, "--multi-thread-cutoff="+rcloneCutoff)
+	err = run("rclone", "copy", remote+":Takeout", takeoutDir, "--filter-from", filterPath, "--progress", "--transfers="+rcloneTransfers, "--checkers="+rcloneCheckers, "--multi-thread-streams="+rcloneStreams, "--multi-thread-cutoff="+rcloneCutoff)
 	if err != nil {
 		return err
 	}
@@ -579,7 +658,9 @@ func normalizeNFC(root string) (int, int, error) {
 
 func runGPTH() error {
 	fmt.Println("===== GPTH Neo 실행 =====")
-	ensureDirs()
+	if err := ensureDirs(); err != nil {
+		return err
+	}
 	bin := gpthBin
 	if _, e := os.Stat(bin); e != nil {
 		p, e := exec.LookPath("gpth")
@@ -595,7 +676,10 @@ func runGPTH() error {
 	if seven == "" {
 		return errors.New("7-Zip이 없습니다")
 	}
-	zips := zipFiles()
+	zips, zipErr := zipFiles()
+	if zipErr != nil {
+		return zipErr
+	}
 	if len(zips) == 0 {
 		return errors.New("Takeout ZIP 파일이 없습니다")
 	}
@@ -611,13 +695,17 @@ func runGPTH() error {
 		if c == "1" {
 			reuse = true
 		} else if c == "2" {
-			os.RemoveAll(normalizedInputDir)
+			if err := os.RemoveAll(normalizedInputDir); err != nil {
+				return fmt.Errorf("임시 입력 삭제: %w", err)
+			}
 		} else {
 			return nil
 		}
 	}
 	if !reuse {
-		_ = os.MkdirAll(normalizedInputDir, 0755)
+		if err := os.MkdirAll(normalizedInputDir, 0755); err != nil {
+			return err
+		}
 		fmt.Println("\n===== Takeout 압축해제 준비 =====")
 		fmt.Printf("ZIP 파일       : %d개\nZIP 총 용량    : %s\n압축해제 방식  : 7-Zip (%s)\n임시 입력 경로 : %s\n여유 공간      : %s\n", len(zips), humanBytes(sumFiles(takeoutDir, zips)), filepath.Base(seven), normalizedInputDir, humanBytes(freeBytes(workRoot)))
 		fmt.Println("\n압축해제 후: NFC 정규화 → NFC 검증 → GPTH 실행\n1) 압축해제 시작 [기본값]\n2) 취소")
@@ -696,24 +784,31 @@ func runGPTH() error {
 		args = append(args, "--no-resume")
 	}
 	start := time.Now()
-	fmt.Println("\nGPTH Neo 처리를 시작합니다...\n")
+	fmt.Print("\nGPTH Neo 처리를 시작합니다...\n\n")
 	if err := run(bin, args...); err != nil {
 		return err
 	}
 	fmt.Println("\n✔ GPTH Neo 작업 완료\n소요 시간:", formatDuration(time.Since(start)))
 	fmt.Println("임시 NFC 입력 디렉터리 정리:", normalizedInputDir)
-	_ = os.RemoveAll(normalizedInputDir)
+	if err := os.RemoveAll(normalizedInputDir); err != nil {
+		return fmt.Errorf("GPTH 처리 완료 후 임시 입력 삭제 실패: %w", err)
+	}
 	sendEmail("GPTH Neo 사진 정리", "성공", fmt.Sprintf("- 출력 경로: %s\n- Albums: %s\n- Date folders: %s\n- Write EXIF: %t\n- Keep duplicates: %t\n- Keep input: %t\n- Resume: %t\n- 소요 시간: %s", processedDir, albums, dateDesc, writeExif, keepDup, keepInput, resume, formatDuration(time.Since(start))))
 	return nil
 }
 
 func createArchive() error {
 	fmt.Println("===== GPTH 결과 TAR + SHA256 생성 =====")
-	ensureDirs()
+	if err := ensureDirs(); err != nil {
+		return err
+	}
 	if dirSize(processedDir) == 0 {
 		return errors.New("처리 결과가 없습니다")
 	}
-	zips := zipFiles()
+	zips, zipErr := zipFiles()
+	if zipErr != nil {
+		return zipErr
+	}
 	proc := dirSize(processedDir)
 	free := freeBytes(archiveDir)
 	if len(zips) > 0 {
@@ -723,7 +818,9 @@ func createArchive() error {
 		fmt.Println("※ 예상 Archive 용량은 TAR(무압축) 기준이며 실제 크기는 약간 달라질 수 있습니다.")
 		if confirm("Archive 생성 전에 기존 Takeout ZIP 파일을 삭제할까요?", false) {
 			for _, z := range zips {
-				_ = os.Remove(filepath.Join(takeoutDir, z))
+				if err := os.Remove(filepath.Join(takeoutDir, z)); err != nil {
+					return fmt.Errorf("ZIP 삭제 %s: %w", z, err)
+				}
 			}
 			fmt.Println("✔ 기존 Takeout ZIP 파일을 삭제했습니다.")
 		} else {
@@ -737,6 +834,9 @@ func createArchive() error {
 		name = def
 	}
 	name = strings.TrimSuffix(name, ".tar")
+	if !safeArchiveName(name) {
+		return errors.New("Archive 이름에는 경로 구분자, 제어문자, 와일드카드를 사용할 수 없습니다")
+	}
 	mode := selectOne([]string{"단일 TAR", "50GB 분할 TAR"}, "방식 선택: ")
 	start := time.Now()
 	tarName := name + ".tar"
@@ -760,13 +860,18 @@ func createArchive() error {
 		}
 	} else {
 		prefix := filepath.Join(archiveDir, tarName+".part.")
-		old, _ := filepath.Glob(prefix + "*")
+		old, err := filepath.Glob(prefix + "*")
+		if err != nil {
+			return err
+		}
 		if len(old) > 0 {
 			if !confirm("기존 분할 파일을 삭제하고 다시 만들까요?", false) {
 				return nil
 			}
 			for _, p := range old {
-				_ = os.Remove(p)
+				if err := os.Remove(p); err != nil {
+					return fmt.Errorf("분할 파일 삭제 %s: %w", p, err)
+				}
 			}
 		}
 		fmt.Println("[1/2] 50GB 분할 TAR 생성...")
@@ -774,7 +879,13 @@ func createArchive() error {
 			return err
 		}
 		fmt.Println("[2/2] SHA256 생성...")
-		parts, _ := filepath.Glob(prefix + "*")
+		parts, err := filepath.Glob(prefix + "*")
+		if err != nil {
+			return err
+		}
+		if len(parts) == 0 {
+			return errors.New("분할 TAR 파일이 생성되지 않았습니다")
+		}
 		sort.Strings(parts)
 		var b strings.Builder
 		for _, p := range parts {
@@ -797,34 +908,35 @@ func pipeTar(dest string, split bool) error {
 	tar := exec.Command("tar", "-cf", "-", "-C", filepath.Dir(processedDir), filepath.Base(processedDir))
 	tar.Stderr = os.Stderr
 	if !split {
-		f, e := os.Create(dest)
-		if e != nil {
-			return e
+		f, err := os.Create(dest)
+		if err != nil {
+			return err
 		}
-		defer f.Close()
 		tar.Stdout = f
-		return tar.Run()
+		return errors.Join(tar.Run(), f.Close())
 	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	defer w.Close()
 	sp := exec.Command("split", "-b", "50G", "-", dest)
-	sp.StdinPipe()
-	r, w := io.Pipe()
 	tar.Stdout = w
 	sp.Stdin = r
-	sp.Stdout = os.Stdout
-	sp.Stderr = os.Stderr
-	if e := sp.Start(); e != nil {
-		return e
+	sp.Stdout, sp.Stderr = os.Stdout, os.Stderr
+	if err := sp.Start(); err != nil {
+		return err
 	}
-	if e := tar.Start(); e != nil {
-		return e
+	if err := tar.Start(); err != nil {
+		r.Close()
+		w.Close()
+		return errors.Join(err, sp.Wait())
 	}
-	te := tar.Wait()
+	// Children own the pipe ends now; closing both parent copies lets failures propagate.
+	r.Close()
 	w.Close()
-	se := sp.Wait()
-	if te != nil {
-		return te
-	}
-	return se
+	return errors.Join(tar.Wait(), sp.Wait())
 }
 func shaFile(path string) (string, error) {
 	f, e := os.Open(path)
@@ -915,7 +1027,10 @@ func navigateRemote() (string, error) {
 	for {
 		fmt.Println("\n===== Google Drive 폴더 탐색 =====")
 		fmt.Println("현재 위치:", remote+":/"+cur)
-		out := output("rclone", "lsf", remote+":"+cur, "--dirs-only")
+		out, err := output("rclone", "lsf", remote+":"+cur, "--dirs-only")
+		if err != nil {
+			return "", err
+		}
 		var dirs []string
 		for _, s := range strings.Split(out, "\n") {
 			s = strings.TrimSuffix(strings.TrimSpace(s), "/")
@@ -957,7 +1072,9 @@ func navigateRemote() (string, error) {
 				if cur != "" {
 					p = cur + "/" + d
 				}
-				_ = run("rclone", "mkdir", remote+":"+p)
+				if err := run("rclone", "mkdir", remote+":"+p); err != nil {
+					return "", err
+				}
 				stack = append(stack, cur)
 				cur = p
 			}
@@ -968,23 +1085,21 @@ func navigateRemote() (string, error) {
 			stack = stack[:len(stack)-1]
 			continue
 		}
-		return "", errors.New("취소")
+		return "", errCancelled
 	}
 }
-func archiveFiles() []string {
+func archiveFiles() ([]string, error) {
 	return filesMatching(archiveDir, func(s string) bool {
 		return strings.HasSuffix(s, ".tar") || strings.Contains(s, ".tar.part.") || strings.HasSuffix(s, ".sha256.txt")
 	})
 }
 func rcloneSelected(src, dst string, selected []string) error {
-	f, _ := os.CreateTemp("", "rclone-filter-*")
-	defer os.Remove(f.Name())
-	for _, s := range selected {
-		fmt.Fprintf(f, "+ /%s\n", s)
+	filterPath, err := selectedFilter(selected)
+	if err != nil {
+		return err
 	}
-	fmt.Fprintln(f, "- *")
-	f.Close()
-	return run("rclone", "copy", src, dst, "--filter-from", f.Name(), "--progress", "--transfers="+rcloneTransfers, "--checkers="+rcloneCheckers, "--multi-thread-streams="+rcloneStreams, "--multi-thread-cutoff="+rcloneCutoff)
+	defer warnCleanup(filterPath, false)
+	return run("rclone", "copy", src, dst, "--filter-from", filterPath, "--progress", "--transfers="+rcloneTransfers, "--checkers="+rcloneCheckers, "--multi-thread-streams="+rcloneStreams, "--multi-thread-cutoff="+rcloneCutoff)
 }
 func chooseFiles(files []string, prompt string) []string {
 	menu := append(append([]string{}, files...), "전체 선택")
@@ -1003,14 +1118,20 @@ func uploadArchive() error {
 	if e := ensureRemote(); e != nil {
 		return e
 	}
-	files := archiveFiles()
+	files, listErr := archiveFiles()
+	if listErr != nil {
+		return listErr
+	}
 	if len(files) == 0 {
 		return errors.New("Archive 파일이 없습니다")
 	}
 	sel := chooseFiles(files, "업로드 파일 선택 (공백 구분): ")
 	dest, e := navigateRemote()
-	if e != nil {
+	if errors.Is(e, errCancelled) {
 		return nil
+	}
+	if e != nil {
+		return e
 	}
 	start := time.Now()
 	if e = rcloneSelected(archiveDir, remote+":"+dest, sel); e != nil {
@@ -1026,11 +1147,17 @@ func retrieveArchive() error {
 		return e
 	}
 	p, e := navigateRemote()
-	if e != nil {
+	if errors.Is(e, errCancelled) {
 		return nil
 	}
+	if e != nil {
+		return e
+	}
 	rp := remote + ":" + p
-	out := output("rclone", "lsf", rp, "--files-only")
+	out, e := output("rclone", "lsf", rp, "--files-only")
+	if e != nil {
+		return e
+	}
 	var files []string
 	for _, s := range strings.Split(out, "\n") {
 		if strings.HasSuffix(s, ".tar") || strings.Contains(s, ".tar.part.") || strings.HasSuffix(s, ".sha256.txt") {
@@ -1052,7 +1179,10 @@ func retrieveArchive() error {
 }
 func verifyArchive() error {
 	fmt.Println("===== Archive SHA256 검증 =====")
-	files := filesMatching(archiveDir, func(s string) bool { return strings.HasSuffix(s, ".sha256.txt") })
+	files, listErr := filesMatching(archiveDir, func(s string) bool { return strings.HasSuffix(s, ".sha256.txt") })
+	if listErr != nil {
+		return listErr
+	}
 	if len(files) == 0 {
 		return errors.New("SHA256 파일이 없습니다")
 	}
@@ -1061,41 +1191,57 @@ func verifyArchive() error {
 	if e != nil {
 		return e
 	}
-	for _, ln := range strings.Split(strings.TrimSpace(string(b)), "\n") {
-		parts := strings.Fields(ln)
-		if len(parts) < 2 {
-			continue
-		}
-		h, e := shaFileWithProgress(filepath.Join(archiveDir, parts[1]))
+	entries, e := parseChecksums(string(b))
+	if e != nil {
+		return e
+	}
+	for _, entry := range entries {
+		h, e := shaFileWithProgress(filepath.Join(archiveDir, entry.Name))
 		if e != nil {
 			return e
 		}
-		if h != parts[0] {
-			return fmt.Errorf("%s: FAILED", parts[1])
+		if h != entry.Hash {
+			return fmt.Errorf("%s: FAILED", entry.Name)
 		}
-		fmt.Println(parts[1] + ": OK")
+		fmt.Println(entry.Name + ": OK")
 	}
 	fmt.Println("✔ Archive SHA256 검증 완료")
 	return nil
 }
 func showMacRsync() {
 	clear()
-	fmt.Println("==========================================================\n  Mac으로 Archive 파일 전송 (rsync 명령어)\n==========================================================\n")
-	fmt.Printf("rsync -avP root@%s:%s/ .\n\n전송 완료 후:\nshasum -a 256 -c *.sha256.txt\n", containerIP, archiveDir)
+	fmt.Print("==========================================================\n  Mac으로 Archive 파일 전송 (rsync 명령어)\n==========================================================\n\n")
+	fmt.Printf("rsync -avP %s .\n\n전송 완료 후:\nshasum -a 256 -c *.sha256.txt\n", shellQuote("root@"+containerIP+":"+shellQuote(archiveDir+"/")))
 }
 func showWorkStatus() error {
-	ensureDirs()
+	if err := ensureDirs(); err != nil {
+		return err
+	}
 	clear()
-	fmt.Println("==========================================================\n  /work 스토리지 및 전체 디렉터리 현황\n==========================================================")
+	fmt.Printf("==========================================================\n  %s 스토리지 및 전체 디렉터리 현황\n==========================================================\n", workRoot)
 	fmt.Printf("\n여유 공간: %s\nprocessed: %s (파일 %d개)\ntakeout: %s\narchive: %s\n임시 NFC: %s\n", humanBytes(freeBytes(workRoot)), humanBytes(dirSize(processedDir)), fileCount(processedDir), humanBytes(dirSize(takeoutDir)), humanBytes(dirSize(archiveDir)), humanBytes(dirSize(normalizedInputDir)))
 	fmt.Println("\n▶ Takeout ZIP")
-	for _, f := range zipFiles() {
-		st, _ := os.Stat(filepath.Join(takeoutDir, f))
+	zips, err := zipFiles()
+	if err != nil {
+		return err
+	}
+	for _, f := range zips {
+		st, err := os.Stat(filepath.Join(takeoutDir, f))
+		if err != nil {
+			return err
+		}
 		fmt.Printf("  %-10s %s\n", humanBytes(st.Size()), f)
 	}
 	fmt.Println("▶ Archive")
-	for _, f := range archiveFiles() {
-		st, _ := os.Stat(filepath.Join(archiveDir, f))
+	archives, err := archiveFiles()
+	if err != nil {
+		return err
+	}
+	for _, f := range archives {
+		st, err := os.Stat(filepath.Join(archiveDir, f))
+		if err != nil {
+			return err
+		}
 		fmt.Printf("  %-10s %s\n", humanBytes(st.Size()), f)
 	}
 	return nil
