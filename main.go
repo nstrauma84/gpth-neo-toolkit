@@ -1,0 +1,1160 @@
+package main
+
+import (
+	"bufio"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/smtp"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"golang.org/x/text/unicode/norm"
+)
+
+const (
+	remote             = "gdrive"
+	containerIP        = "192.168.10.115"
+	workRoot           = "/work"
+	takeoutDir         = "/work/takeout"
+	processedDir       = "/work/processed"
+	archiveDir         = "/work/archive"
+	normalizedInputDir = "/work/takeout-nfc"
+
+	gpthRepo = "Xentraxx/GooglePhotosTakeoutHelper_Neo"
+	gpthBin  = "/usr/local/bin/gpth"
+
+	rcloneTransfers = "4"
+	rcloneCheckers  = "8"
+	rcloneStreams   = "4"
+	rcloneCutoff    = "250M"
+
+	enableEmailNotify = true
+	smtpServer        = "smtp.gmail.com:465"
+	smtpUser          = "nomoreaspirin@gmail.com"
+	alertTo           = "inyourskull@gmail.com"
+	smtpCredential    = "/root/.gpth-smtp"
+
+	tmuxSession = "gpth-session"
+)
+
+var in = bufio.NewReader(os.Stdin)
+
+func main() {
+	if err := tmuxGuard(); err != nil {
+		fmt.Fprintln(os.Stderr, "tmux:", err)
+		os.Exit(1)
+	}
+	ensureDirs()
+	mainMenu()
+}
+
+func tmuxGuard() error {
+	if os.Getenv("TMUX") != "" || os.Getenv("GPTH_NO_TMUX") == "1" {
+		return nil
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		fmt.Println("tmux가 설치되어 있지 않습니다. 설치를 진행합니다...")
+		if err := run("apt-get", "update"); err != nil {
+			return err
+		}
+		if err := run("apt-get", "install", "-y", "tmux"); err != nil {
+			return err
+		}
+	}
+	if exec.Command("tmux", "has-session", "-t", tmuxSession).Run() == nil {
+		fmt.Printf("기존에 실행 중인 tmux 세션(%s)으로 연결합니다...\n", tmuxSession)
+		return syscall.Exec("/usr/bin/tmux", []string{"tmux", "attach-session", "-t", tmuxSession}, os.Environ())
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("tmux 세션(%s)을 생성하고 프로그램을 보호 모드로 실행합니다...\n", tmuxSession)
+	return syscall.Exec("/usr/bin/tmux", []string{"tmux", "new-session", "-s", tmuxSession, self}, os.Environ())
+}
+
+func mainMenu() {
+	for {
+		clear()
+		fmt.Println("========================================")
+		fmt.Println(" Google Photos Archive Toolkit (Go)")
+		fmt.Println("========================================")
+		fmt.Println()
+		statusLine()
+		fmt.Println("\n----------------------------------------\n")
+		fmt.Println("0) GPTH Neo 버전 확인 / 업데이트")
+		fmt.Println()
+		fmt.Println("1) Google Takeout ZIP 다운로드")
+		fmt.Println("2) GPTH Neo 실행")
+		fmt.Println("3) GPTH 결과 TAR + SHA256 생성")
+		fmt.Println("4) Google Drive로 Archive")
+		fmt.Println("5) Archive Retrieve")
+		fmt.Println("6) Archive SHA256 검증")
+		fmt.Println()
+		fmt.Println("s) /work 디스크 및 파일 현황")
+		fmt.Println("m) Mac으로 Archive 복사 명령어 보기")
+		fmt.Println("t) SMTP 이메일 알림 테스트 발송")
+		fmt.Println("7) 종료")
+		fmt.Print("번호 선택: ")
+		c := readLine()
+		if c == "7" {
+			fmt.Println("종료합니다.")
+			return
+		}
+
+		valid := map[string]bool{"0": true, "1": true, "2": true, "3": true, "4": true, "5": true, "6": true, "s": true, "m": true, "t": true}
+		if valid[strings.ToLower(c)] {
+			showStorageStatus()
+		}
+
+		var err error
+		switch strings.ToLower(c) {
+		case "0":
+			err = updateGPTH()
+		case "1":
+			err = downloadTakeout()
+		case "2":
+			err = runGPTH()
+		case "3":
+			err = createArchive()
+		case "4":
+			err = uploadArchive()
+		case "5":
+			err = retrieveArchive()
+		case "6":
+			err = verifyArchive()
+		case "s":
+			err = showWorkStatus()
+		case "m":
+			showMacRsync()
+		case "t":
+			err = testSMTP()
+		default:
+			fmt.Println("잘못된 번호입니다.")
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "✘", err)
+		}
+		pause()
+	}
+}
+
+func readLine() string {
+	s, _ := in.ReadString('\n')
+	return strings.TrimSpace(s)
+}
+func pause() { fmt.Print("\nEnter를 누르세요..."); _, _ = in.ReadString('\n') }
+func clear() { fmt.Print("\033[H\033[2J") }
+func ensureDirs() {
+	for _, d := range []string{takeoutDir, processedDir, archiveDir} {
+		_ = os.MkdirAll(d, 0755)
+	}
+}
+func run(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return cmd.Run()
+}
+func output(name string, args ...string) string {
+	b, err := exec.Command(name, args...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+func existsCmd(name string) bool { _, err := exec.LookPath(name); return err == nil }
+func formatDuration(d time.Duration) string {
+	s := int(d.Seconds())
+	h, m := s/3600, (s%3600)/60
+	if h > 0 {
+		return fmt.Sprintf("%d시간 %02d분 %02d초", h, m, s%60)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%d분 %02d초", m, s%60)
+	}
+	return fmt.Sprintf("%d초", s)
+}
+func confirm(prompt string, defaultYes bool) bool {
+	for {
+		if defaultYes {
+			fmt.Printf("%s [Y/n]: ", prompt)
+		} else {
+			fmt.Printf("%s [y/N]: ", prompt)
+		}
+		a := strings.ToLower(readLine())
+		if a == "" {
+			return defaultYes
+		}
+		if a == "y" || a == "yes" {
+			return true
+		}
+		if a == "n" || a == "no" {
+			return false
+		}
+		fmt.Println("y 또는 n을 입력하세요.")
+	}
+}
+func humanBytes(n int64) string {
+	const unit = int64(1024)
+	if n < unit {
+		return fmt.Sprintf("%dB", n)
+	}
+	div, exp := unit, 0
+	for q := n / unit; q >= unit; q /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+func dirSize(root string) int64 {
+	var total int64
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err == nil && info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+func fileCount(root string) int {
+	n := 0
+	_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info.Mode().IsRegular() {
+			n++
+		}
+		return nil
+	})
+	return n
+}
+func freeBytes(path string) int64 {
+	var st syscall.Statfs_t
+	if syscall.Statfs(path, &st) != nil {
+		return 0
+	}
+	return int64(st.Bavail) * int64(st.Bsize)
+}
+func filesMatching(dir string, pred func(string) bool) []string {
+	ents, _ := os.ReadDir(dir)
+	var a []string
+	for _, e := range ents {
+		if !e.IsDir() && pred(e.Name()) {
+			a = append(a, e.Name())
+		}
+	}
+	sort.Strings(a)
+	return a
+}
+func zipFiles() []string {
+	return filesMatching(takeoutDir, func(s string) bool { return strings.HasSuffix(strings.ToLower(s), ".zip") })
+}
+func sumFiles(dir string, names []string) int64 {
+	var n int64
+	for _, f := range names {
+		if st, err := os.Stat(filepath.Join(dir, f)); err == nil {
+			n += st.Size()
+		}
+	}
+	return n
+}
+func showStorageStatus() {
+	ensureDirs()
+	z := zipFiles()
+	fmt.Println("\n===== 현재 저장공간 / 작업 용량 =====")
+	fmt.Printf("현재 여유 공간       : %s\n", humanBytes(freeBytes(workRoot)))
+	fmt.Printf("/work 전체 사용량    : %s\n", humanBytes(dirSize(workRoot)))
+	fmt.Printf("Takeout              : %s (ZIP %d개 / %s)\n", humanBytes(dirSize(takeoutDir)), len(z), humanBytes(sumFiles(takeoutDir, z)))
+	fmt.Printf("임시 NFC 입력        : %s\n", humanBytes(dirSize(normalizedInputDir)))
+	fmt.Printf("GPTH 처리 결과       : %s\n", humanBytes(dirSize(processedDir)))
+	fmt.Printf("Archive              : %s\n\n", humanBytes(dirSize(archiveDir)))
+}
+
+type release struct {
+	TagName string `json:"tag_name"`
+	Assets  []struct {
+		Name, BrowserDownloadURL string `json:"name","browser_download_url"`
+	} `json:"assets"`
+}
+
+func githubRelease(url string) (release, error) {
+	var r release
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "gpth-toolkit-go")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return r, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return r, fmt.Errorf("GitHub HTTP %s", resp.Status)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&r)
+	return r, err
+}
+func latestTag() string {
+	r, err := githubRelease("https://api.github.com/repos/" + gpthRepo + "/releases/latest")
+	if err != nil {
+		return ""
+	}
+	return r.TagName
+}
+func installedVersion() string {
+	bin := gpthBin
+	if _, err := os.Stat(bin); err != nil {
+		if p, e := exec.LookPath("gpth"); e == nil {
+			bin = p
+		} else {
+			return ""
+		}
+	}
+	b, err := os.ReadFile(bin)
+	if err != nil {
+		return ""
+	}
+	re := regexp.MustCompile(`GooglePhotosTakeoutHelper v([0-9]+(?:\.[0-9]+)+)`)
+	m := re.FindSubmatch(b)
+	if len(m) > 1 {
+		return "v" + string(m[1])
+	}
+	return ""
+}
+func find7zip() string {
+	if p, e := exec.LookPath("7zz"); e == nil {
+		return p
+	}
+	if p, e := exec.LookPath("7z"); e == nil {
+		return p
+	}
+	return ""
+}
+func statusLine() {
+	fmt.Printf("컨테이너 IP : %s\n", containerIP)
+	i, l := installedVersion(), latestTag()
+	if i == "" {
+		fmt.Println("GPTH Neo    : ✘ NOT FOUND")
+	} else if l == "" {
+		fmt.Printf("GPTH Neo    : %s  ? latest 확인 실패\n", i)
+	} else if i == l {
+		fmt.Printf("GPTH Neo    : %s  ✔ Latest\n", i)
+	} else {
+		fmt.Printf("GPTH Neo    : %s  ⚠ Latest: %s\n", i, l)
+	}
+	for _, x := range []struct{ n, l string }{{"rclone", "rclone"}, {"rsync", "rsync"}, {"exiftool", "ExifTool"}} {
+		if existsCmd(x.n) {
+			fmt.Printf("%-12s: installed\n", x.l)
+		} else {
+			fmt.Printf("%-12s: ✘ NOT FOUND\n", x.l)
+		}
+	}
+	if find7zip() != "" {
+		fmt.Println("7-Zip       : installed")
+	} else {
+		fmt.Println("7-Zip       : ✘ NOT FOUND")
+	}
+	if enableEmailNotify {
+		if smtpPassword() != "" {
+			fmt.Printf("SMTP 알림   : 활성화 (%s) ✔\n", alertTo)
+		} else {
+			fmt.Printf("SMTP 알림   : ⚠ 인증정보 없음 (%s)\n", smtpCredential)
+		}
+	}
+}
+func updateGPTH() error {
+	fmt.Println("===== GPTH Neo 버전 확인 / 업데이트 =====")
+	r, err := githubRelease("https://api.github.com/repos/" + gpthRepo + "/releases/latest")
+	if err != nil {
+		return err
+	}
+	fmt.Println("설치 버전 :", installedVersion())
+	fmt.Println("최신 버전 :", r.TagName)
+	if installedVersion() == r.TagName {
+		fmt.Println("✔ 최신 버전입니다.")
+		return nil
+	}
+	if !confirm("GPTH Neo "+r.TagName+"를 설치/업데이트할까요?", false) {
+		return nil
+	}
+	var url string
+	for _, a := range r.Assets {
+		n := strings.ToLower(a.Name)
+		if strings.Contains(n, "linux") && (strings.Contains(n, "x86_64") || strings.Contains(n, "amd64") || strings.Contains(n, "x64")) {
+			url = a.BrowserDownloadURL
+			break
+		}
+	}
+	if url == "" {
+		return errors.New("Linux x86_64 release 파일을 찾지 못했습니다")
+	}
+	tmp, _ := os.MkdirTemp("", "gpth-update-*")
+	defer os.RemoveAll(tmp)
+	dst := filepath.Join(tmp, "asset")
+	if err := downloadURL(url, dst); err != nil {
+		return err
+	}
+	candidate := dst
+	if strings.HasSuffix(strings.ToLower(url), ".zip") {
+		if !existsCmd("unzip") {
+			return errors.New("unzip이 필요합니다")
+		}
+		unp := filepath.Join(tmp, "unpacked")
+		_ = os.MkdirAll(unp, 0755)
+		if err := run("unzip", "-q", dst, "-d", unp); err != nil {
+			return err
+		}
+		_ = filepath.Walk(unp, func(p string, info os.FileInfo, err error) error {
+			if candidate == dst && err == nil && !info.IsDir() && strings.HasPrefix(strings.ToLower(info.Name()), "gpth") {
+				candidate = p
+			}
+			return nil
+		})
+	}
+	b, err := os.ReadFile(candidate)
+	if err != nil {
+		return err
+	}
+	if err = os.WriteFile(gpthBin, b, 0755); err != nil {
+		return err
+	}
+	fmt.Println("✔ 설치 완료:", gpthBin)
+	return nil
+}
+func downloadURL(url, dst string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("download HTTP %s", resp.Status)
+	}
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(f, resp.Body)
+	return err
+}
+
+func ensureRemote() error {
+	if !existsCmd("rclone") {
+		return errors.New("rclone 없음")
+	}
+	out := output("rclone", "listremotes")
+	if !strings.Contains(out, remote+":") {
+		return fmt.Errorf("remote %s: 없음", remote)
+	}
+	return nil
+}
+func selectMany(options []string, prompt string) []int {
+	for {
+		for i, s := range options {
+			fmt.Printf("%d) %s\n", i+1, s)
+		}
+		fmt.Print(prompt)
+		f := strings.Fields(readLine())
+		var out []int
+		ok := len(f) > 0
+		for _, x := range f {
+			n, e := strconv.Atoi(x)
+			if e != nil || n < 1 || n > len(options) {
+				ok = false
+				break
+			}
+			out = append(out, n-1)
+		}
+		if ok {
+			return out
+		}
+		fmt.Println("잘못된 입력입니다. 예: 1 2")
+	}
+}
+func selectOne(options []string, prompt string) int { return selectMany(options, prompt)[0] }
+
+func downloadTakeout() error {
+	fmt.Println("===== Google Takeout ZIP 다운로드 =====")
+	if err := ensureRemote(); err != nil {
+		return err
+	}
+	ensureDirs()
+	out := output("rclone", "lsf", remote+":Takeout", "--files-only")
+	var files []string
+	for _, s := range strings.Split(out, "\n") {
+		if strings.HasSuffix(strings.ToLower(strings.TrimSpace(s)), ".zip") {
+			files = append(files, strings.TrimSpace(s))
+		}
+	}
+	sort.Strings(files)
+	if len(files) == 0 {
+		return errors.New("Takeout 폴더에 ZIP 파일이 없습니다")
+	}
+	menu := append(append([]string{}, files...), "전체 다운로드")
+	picks := selectMany(menu, "다운로드 파일 선택 (공백 구분): ")
+	var sel []string
+	for _, i := range picks {
+		if i == len(files) {
+			sel = append([]string{}, files...)
+			break
+		}
+		sel = append(sel, files[i])
+	}
+	if len(zipFiles()) > 0 && !confirm("기존 파일을 유지한 채 다운로드를 계속할까요?", false) {
+		return nil
+	}
+	filter, _ := os.CreateTemp("", "takeout-filter-*")
+	defer os.Remove(filter.Name())
+	for _, s := range sel {
+		fmt.Fprintf(filter, "+ /%s\n", s)
+	}
+	fmt.Fprintln(filter, "- *")
+	filter.Close()
+	start := time.Now()
+	err := run("rclone", "copy", remote+":Takeout", takeoutDir, "--filter-from", filter.Name(), "--progress", "--transfers="+rcloneTransfers, "--checkers="+rcloneCheckers, "--multi-thread-streams="+rcloneStreams, "--multi-thread-cutoff="+rcloneCutoff)
+	if err != nil {
+		return err
+	}
+	fmt.Println("✔ 다운로드 완료:", takeoutDir)
+	sendEmail("Google Takeout 다운로드", "성공", fmt.Sprintf("- 저장 경로: %s\n- 소요 시간: %s\n- 다운로드 파일 수: %d개", takeoutDir, formatDuration(time.Since(start)), len(sel)))
+	return nil
+}
+
+func normalizeNFC(root string) (int, int, error) {
+	type renamePair struct{ src, dst string }
+	var changes []renamePair
+
+	// WalkDir is lexical/top-down, so collect then sort deepest paths first.
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == root {
+			return nil
+		}
+		name := d.Name()
+		newName := norm.NFC.String(name)
+		if newName == name {
+			return nil
+		}
+		dst := filepath.Join(filepath.Dir(path), newName)
+		if _, err := os.Lstat(dst); err == nil {
+			return fmt.Errorf("NFC 이름 충돌: %s => %s", path, dst)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		changes = append(changes, renamePair{path, dst})
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+
+	sort.Slice(changes, func(i, j int) bool {
+		return strings.Count(changes[i].src, string(os.PathSeparator)) >
+			strings.Count(changes[j].src, string(os.PathSeparator))
+	})
+	for _, p := range changes {
+		if err := os.Rename(p.src, p.dst); err != nil {
+			return 0, 0, fmt.Errorf("NFC rename 실패: %s => %s: %w", p.src, p.dst, err)
+		}
+	}
+
+	remain := 0
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path != root && d.Name() != norm.NFC.String(d.Name()) {
+			remain++
+		}
+		return nil
+	})
+	return len(changes), remain, err
+}
+
+func runGPTH() error {
+	fmt.Println("===== GPTH Neo 실행 =====")
+	ensureDirs()
+	bin := gpthBin
+	if _, e := os.Stat(bin); e != nil {
+		p, e := exec.LookPath("gpth")
+		if e != nil {
+			return errors.New("GPTH Neo가 설치되어 있지 않습니다. 먼저 0번을 실행하세요")
+		}
+		bin = p
+	}
+	if !existsCmd("exiftool") {
+		return errors.New("ExifTool이 없습니다")
+	}
+	seven := find7zip()
+	if seven == "" {
+		return errors.New("7-Zip이 없습니다")
+	}
+	zips := zipFiles()
+	if len(zips) == 0 {
+		return errors.New("Takeout ZIP 파일이 없습니다")
+	}
+	reuse := false
+	if dirSize(normalizedInputDir) > 0 {
+		fmt.Println("⚠ 기존 작업 디렉터리가 있습니다:", normalizedInputDir)
+		fmt.Println("1) 기존 디렉터리 재사용 [기본값]\n2) 삭제 후 ZIP에서 다시 만들기\n3) 취소")
+		fmt.Print("선택 [1]: ")
+		c := readLine()
+		if c == "" {
+			c = "1"
+		}
+		if c == "1" {
+			reuse = true
+		} else if c == "2" {
+			os.RemoveAll(normalizedInputDir)
+		} else {
+			return nil
+		}
+	}
+	if !reuse {
+		_ = os.MkdirAll(normalizedInputDir, 0755)
+		fmt.Println("\n===== Takeout 압축해제 준비 =====")
+		fmt.Printf("ZIP 파일       : %d개\nZIP 총 용량    : %s\n압축해제 방식  : 7-Zip (%s)\n임시 입력 경로 : %s\n여유 공간      : %s\n", len(zips), humanBytes(sumFiles(takeoutDir, zips)), filepath.Base(seven), normalizedInputDir, humanBytes(freeBytes(workRoot)))
+		fmt.Println("\n압축해제 후: NFC 정규화 → NFC 검증 → GPTH 실행\n1) 압축해제 시작 [기본값]\n2) 취소")
+		fmt.Print("선택 [1]: ")
+		c := readLine()
+		if c == "2" {
+			return nil
+		}
+		start := time.Now()
+		for _, z := range zips {
+			fmt.Println("▶", z)
+			if err := run(seven, "x", "-y", "-aoa", "-o"+normalizedInputDir, filepath.Join(takeoutDir, z)); err != nil {
+				return fmt.Errorf("압축 해제 실패: %s: %w", z, err)
+			}
+		}
+		sendEmail("Takeout ZIP 압축해제", "성공", fmt.Sprintf("- ZIP 파일 수: %d개\n- 원본 ZIP 총 용량: %s\n- 압축해제 후 용량: %s\n- 압축해제 경로: %s\n- 소요 시간: %s", len(zips), humanBytes(sumFiles(takeoutDir, zips)), humanBytes(dirSize(normalizedInputDir)), normalizedInputDir, formatDuration(time.Since(start))))
+	}
+	fmt.Println("\n===== Unicode 파일명 NFC 검사 / 정규화 =====")
+	changed, remain, err := normalizeNFC(normalizedInputDir)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("NFC 변환 완료: %d개\n", changed)
+	fmt.Printf("NFC 검증: 비-NFC 이름 %d개\n", remain)
+	if remain != 0 {
+		return errors.New("비-NFC 이름이 남아 있습니다")
+	}
+	if dirSize(processedDir) > 0 && !confirm("출력 폴더가 비어 있지 않습니다. 이 출력 폴더를 사용해 계속할까요?", false) {
+		return nil
+	}
+
+	albums, divide := "json", "1"
+	writeExif, keepDup, keepInput, resume := true, false, false, true
+	fmt.Println("\n1) 평소 설정으로 실행 [기본값]\n2) 옵션 직접 선택\n3) 취소")
+	fmt.Print("선택 [1]: ")
+	mode := readLine()
+	if mode == "" {
+		mode = "1"
+	}
+	if mode == "3" {
+		return nil
+	}
+	if mode == "2" {
+		albums = []string{"json", "shortcut", "reverse-shortcut", "duplicate-copy", "nothing", "ignore"}[selectOne([]string{"JSON [평소 설정]", "Shortcut", "Reverse shortcut", "Duplicate copy", "Nothing", "Ignore"}, "앨범 처리 방식 선택: ")]
+		divide = []string{"1", "2", "3", "0"}[selectOne([]string{"연도별 [평소 설정]", "연도/월", "연도/월/일", "분류 안 함"}, "날짜별 폴더 구조 선택: ")]
+		writeExif = selectOne([]string{"ON [평소 설정]", "OFF"}, "EXIF 기록 선택: ") == 0
+		keepDup = selectOne([]string{"OFF [평소 설정]", "ON"}, "중복 파일 보존 선택: ") == 1
+		keepInput = selectOne([]string{"OFF [평소 설정]", "ON"}, "Input 원본 보존 선택: ") == 1
+		resume = selectOne([]string{"ON [평소 설정]", "OFF"}, "Resume 선택: ") == 0
+	}
+	dateDesc := map[string]string{"0": "분류 안 함", "1": "연도별", "2": "연도/월", "3": "연도/월/일"}[divide]
+	fmt.Println("\n===== GPTH Neo 실행 설정 =====")
+	fmt.Printf("Input            : %s\nOutput           : %s\nAlbums           : %s\nDate folders     : %s\nWrite EXIF       : %t\nKeep duplicates  : %t\nKeep input       : %t\nResume           : %t\nLocal timezone   : 미사용\n", normalizedInputDir, processedDir, albums, dateDesc, writeExif, keepDup, keepInput, resume)
+	if !confirm("이 설정으로 실행할까요?", true) {
+		return nil
+	}
+	args := []string{"--input", normalizedInputDir, "--output", processedDir, "--albums", albums, "--divide-to-dates", divide}
+	if writeExif {
+		args = append(args, "--write-exif")
+	} else {
+		args = append(args, "--no-write-exif")
+	}
+	if keepDup {
+		args = append(args, "--keep-duplicates")
+	} else {
+		args = append(args, "--no-keep-duplicates")
+	}
+	if keepInput {
+		args = append(args, "--keep-input")
+	} else {
+		args = append(args, "--no-keep-input")
+	}
+	if resume {
+		args = append(args, "--resume")
+	} else {
+		args = append(args, "--no-resume")
+	}
+	start := time.Now()
+	fmt.Println("\nGPTH Neo 처리를 시작합니다...\n")
+	if err := run(bin, args...); err != nil {
+		return err
+	}
+	fmt.Println("\n✔ GPTH Neo 작업 완료\n소요 시간:", formatDuration(time.Since(start)))
+	fmt.Println("임시 NFC 입력 디렉터리 정리:", normalizedInputDir)
+	_ = os.RemoveAll(normalizedInputDir)
+	sendEmail("GPTH Neo 사진 정리", "성공", fmt.Sprintf("- 출력 경로: %s\n- Albums: %s\n- Date folders: %s\n- Write EXIF: %t\n- Keep duplicates: %t\n- Keep input: %t\n- Resume: %t\n- 소요 시간: %s", processedDir, albums, dateDesc, writeExif, keepDup, keepInput, resume, formatDuration(time.Since(start))))
+	return nil
+}
+
+func createArchive() error {
+	fmt.Println("===== GPTH 결과 TAR + SHA256 생성 =====")
+	ensureDirs()
+	if dirSize(processedDir) == 0 {
+		return errors.New("처리 결과가 없습니다")
+	}
+	zips := zipFiles()
+	proc := dirSize(processedDir)
+	free := freeBytes(archiveDir)
+	if len(zips) > 0 {
+		zb := sumFiles(takeoutDir, zips)
+		fmt.Println("\n===== Archive 생성 전 디스크 확인 =====")
+		fmt.Printf("현재 여유 공간       : %s\nGPTH 처리 결과 용량  : %s\n예상 Archive 용량    : 약 %s\n\n원본 Takeout ZIP     : %d개 / %s\nZIP 유지 시 예상 여유: %s\nZIP 삭제 시 예상 여유: %s\n", humanBytes(free), humanBytes(proc), humanBytes(proc), len(zips), humanBytes(zb), humanBytes(max64(0, free-proc)), humanBytes(max64(0, free+zb-proc)))
+		fmt.Println("※ 예상 Archive 용량은 TAR(무압축) 기준이며 실제 크기는 약간 달라질 수 있습니다.")
+		if confirm("Archive 생성 전에 기존 Takeout ZIP 파일을 삭제할까요?", false) {
+			for _, z := range zips {
+				_ = os.Remove(filepath.Join(takeoutDir, z))
+			}
+			fmt.Println("✔ 기존 Takeout ZIP 파일을 삭제했습니다.")
+		} else {
+			fmt.Println("✔ 기존 Takeout ZIP 파일을 유지합니다.")
+		}
+	}
+	def := time.Now().Format("20060102")
+	fmt.Printf("Archive 이름 [기본값: %s]: ", def)
+	name := readLine()
+	if name == "" {
+		name = def
+	}
+	name = strings.TrimSuffix(name, ".tar")
+	mode := selectOne([]string{"단일 TAR", "50GB 분할 TAR"}, "방식 선택: ")
+	start := time.Now()
+	tarName := name + ".tar"
+	shaPath := filepath.Join(archiveDir, name+".sha256.txt")
+	if mode == 0 {
+		dst := filepath.Join(archiveDir, tarName)
+		if _, e := os.Stat(dst); e == nil && !confirm(dst+" 가 존재합니다. 덮어쓸까요?", false) {
+			return nil
+		}
+		fmt.Println("[1/2] TAR 생성...")
+		if err := pipeTar(dst, false); err != nil {
+			return err
+		}
+		fmt.Println("[2/2] SHA256 생성...")
+		h, err := shaFile(dst)
+		if err != nil {
+			return err
+		}
+		if err = os.WriteFile(shaPath, []byte(h+"  "+tarName+"\n"), 0644); err != nil {
+			return err
+		}
+	} else {
+		prefix := filepath.Join(archiveDir, tarName+".part.")
+		old, _ := filepath.Glob(prefix + "*")
+		if len(old) > 0 {
+			if !confirm("기존 분할 파일을 삭제하고 다시 만들까요?", false) {
+				return nil
+			}
+			for _, p := range old {
+				_ = os.Remove(p)
+			}
+		}
+		fmt.Println("[1/2] 50GB 분할 TAR 생성...")
+		if err := pipeTar(prefix, true); err != nil {
+			return err
+		}
+		fmt.Println("[2/2] SHA256 생성...")
+		parts, _ := filepath.Glob(prefix + "*")
+		sort.Strings(parts)
+		var b strings.Builder
+		for _, p := range parts {
+			h, e := shaFile(p)
+			if e != nil {
+				return e
+			}
+			fmt.Fprintf(&b, "%s  %s\n", h, filepath.Base(p))
+		}
+		if err := os.WriteFile(shaPath, []byte(b.String()), 0644); err != nil {
+			return err
+		}
+	}
+	fmt.Println("✔ Archive 생성 완료:", archiveDir)
+	fmt.Println("✔ SHA256:", shaPath)
+	sendEmail("TAR + SHA256 생성", "성공", fmt.Sprintf("- 아카이브 파일명: %s\n- 소요 시간: %s\n- 보관 경로: %s", tarName, formatDuration(time.Since(start)), archiveDir))
+	return nil
+}
+func pipeTar(dest string, split bool) error {
+	tar := exec.Command("tar", "-cf", "-", "-C", filepath.Dir(processedDir), filepath.Base(processedDir))
+	tar.Stderr = os.Stderr
+	if !split {
+		f, e := os.Create(dest)
+		if e != nil {
+			return e
+		}
+		defer f.Close()
+		tar.Stdout = f
+		return tar.Run()
+	}
+	sp := exec.Command("split", "-b", "50G", "-", dest)
+	sp.StdinPipe()
+	r, w := io.Pipe()
+	tar.Stdout = w
+	sp.Stdin = r
+	sp.Stdout = os.Stdout
+	sp.Stderr = os.Stderr
+	if e := sp.Start(); e != nil {
+		return e
+	}
+	if e := tar.Start(); e != nil {
+		return e
+	}
+	te := tar.Wait()
+	w.Close()
+	se := sp.Wait()
+	if te != nil {
+		return te
+	}
+	return se
+}
+func shaFile(path string) (string, error) {
+	f, e := os.Open(path)
+	if e != nil {
+		return "", e
+	}
+	defer f.Close()
+	h := sha256.New()
+	_, e = io.Copy(h, f)
+	if e != nil {
+		return "", e
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func shaFileWithProgress(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	total := info.Size()
+	h := sha256.New()
+	buf := make([]byte, 8*1024*1024)
+
+	var done int64
+	start := time.Now()
+	last := time.Time{}
+
+	fmt.Printf("\n대상: %s\n", filepath.Base(path))
+	fmt.Printf("크기: %s\n", humanBytes(total))
+	fmt.Println("SHA256 검증 중...")
+
+	for {
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			if _, err := h.Write(buf[:n]); err != nil {
+				return "", err
+			}
+			done += int64(n)
+
+			now := time.Now()
+			if last.IsZero() || now.Sub(last) >= time.Second || done == total {
+				elapsed := now.Sub(start)
+				speed := float64(done) / elapsed.Seconds()
+				pct := 100.0
+				if total > 0 {
+					pct = float64(done) * 100 / float64(total)
+				}
+
+				eta := "--"
+				if speed > 0 && done < total {
+					eta = formatDuration(time.Duration(float64(total-done)/speed) * time.Second)
+				}
+
+				fmt.Printf("\r진행: %6.2f%% | %s / %s | %s/s | 경과 %s | 남은 시간 %s",
+					pct, humanBytes(done), humanBytes(total), humanBytes(int64(speed)),
+					formatDuration(elapsed), eta)
+				last = now
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			fmt.Println()
+			return "", rerr
+		}
+	}
+	fmt.Println()
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func navigateRemote() (string, error) {
+	cur := ""
+	var stack []string
+	for {
+		fmt.Println("\n===== Google Drive 폴더 탐색 =====")
+		fmt.Println("현재 위치:", remote+":/"+cur)
+		out := output("rclone", "lsf", remote+":"+cur, "--dirs-only")
+		var dirs []string
+		for _, s := range strings.Split(out, "\n") {
+			s = strings.TrimSuffix(strings.TrimSpace(s), "/")
+			if s != "" {
+				dirs = append(dirs, s)
+			}
+		}
+		sort.Strings(dirs)
+		for i, d := range dirs {
+			fmt.Printf("%d) %s/\n", i+1, d)
+		}
+		n := len(dirs)
+		fmt.Printf("%d) 여기 선택\n%d) 새 폴더 만들기\n", n+1, n+2)
+		if len(stack) > 0 {
+			fmt.Printf("%d) 한 단계 위로\n", n+3)
+			fmt.Printf("%d) 취소\n", n+4)
+		} else {
+			fmt.Printf("%d) 취소\n", n+3)
+		}
+		fmt.Print("번호 선택: ")
+		x, _ := strconv.Atoi(readLine())
+		if x >= 1 && x <= n {
+			stack = append(stack, cur)
+			if cur == "" {
+				cur = dirs[x-1]
+			} else {
+				cur += "/" + dirs[x-1]
+			}
+			continue
+		}
+		if x == n+1 {
+			return cur, nil
+		}
+		if x == n+2 {
+			fmt.Print("새 폴더명: ")
+			d := readLine()
+			if d != "" {
+				p := d
+				if cur != "" {
+					p = cur + "/" + d
+				}
+				_ = run("rclone", "mkdir", remote+":"+p)
+				stack = append(stack, cur)
+				cur = p
+			}
+			continue
+		}
+		if len(stack) > 0 && x == n+3 {
+			cur = stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		return "", errors.New("취소")
+	}
+}
+func archiveFiles() []string {
+	return filesMatching(archiveDir, func(s string) bool {
+		return strings.HasSuffix(s, ".tar") || strings.Contains(s, ".tar.part.") || strings.HasSuffix(s, ".sha256.txt")
+	})
+}
+func rcloneSelected(src, dst string, selected []string) error {
+	f, _ := os.CreateTemp("", "rclone-filter-*")
+	defer os.Remove(f.Name())
+	for _, s := range selected {
+		fmt.Fprintf(f, "+ /%s\n", s)
+	}
+	fmt.Fprintln(f, "- *")
+	f.Close()
+	return run("rclone", "copy", src, dst, "--filter-from", f.Name(), "--progress", "--transfers="+rcloneTransfers, "--checkers="+rcloneCheckers, "--multi-thread-streams="+rcloneStreams, "--multi-thread-cutoff="+rcloneCutoff)
+}
+func chooseFiles(files []string, prompt string) []string {
+	menu := append(append([]string{}, files...), "전체 선택")
+	p := selectMany(menu, prompt)
+	var s []string
+	for _, i := range p {
+		if i == len(files) {
+			return append([]string{}, files...)
+		}
+		s = append(s, files[i])
+	}
+	return s
+}
+func uploadArchive() error {
+	fmt.Println("===== Google Drive로 Archive =====")
+	if e := ensureRemote(); e != nil {
+		return e
+	}
+	files := archiveFiles()
+	if len(files) == 0 {
+		return errors.New("Archive 파일이 없습니다")
+	}
+	sel := chooseFiles(files, "업로드 파일 선택 (공백 구분): ")
+	dest, e := navigateRemote()
+	if e != nil {
+		return nil
+	}
+	start := time.Now()
+	if e = rcloneSelected(archiveDir, remote+":"+dest, sel); e != nil {
+		return e
+	}
+	fmt.Println("✔ 업로드 완료")
+	sendEmail("Google Drive 아카이브 업로드", "성공", fmt.Sprintf("- 업로드 대상: %s:%s\n- 파일 목록: %s\n- 소요 시간: %s", remote, dest, strings.Join(sel, " "), formatDuration(time.Since(start))))
+	return nil
+}
+func retrieveArchive() error {
+	fmt.Println("===== Archive Retrieve =====")
+	if e := ensureRemote(); e != nil {
+		return e
+	}
+	p, e := navigateRemote()
+	if e != nil {
+		return nil
+	}
+	rp := remote + ":" + p
+	out := output("rclone", "lsf", rp, "--files-only")
+	var files []string
+	for _, s := range strings.Split(out, "\n") {
+		if strings.HasSuffix(s, ".tar") || strings.Contains(s, ".tar.part.") || strings.HasSuffix(s, ".sha256.txt") {
+			files = append(files, s)
+		}
+	}
+	sort.Strings(files)
+	if len(files) == 0 {
+		return errors.New("Archive 파일이 없습니다")
+	}
+	sel := chooseFiles(files, "가져올 파일 선택 (공백 구분): ")
+	start := time.Now()
+	if e = rcloneSelected(rp, archiveDir, sel); e != nil {
+		return e
+	}
+	fmt.Println("✔ 가져오기 완료:", archiveDir)
+	sendEmail("Archive Retrieve 다운로드", "성공", fmt.Sprintf("- 원본 위치: %s\n- 가져온 파일: %s\n- 소요 시간: %s", rp, strings.Join(sel, " "), formatDuration(time.Since(start))))
+	return nil
+}
+func verifyArchive() error {
+	fmt.Println("===== Archive SHA256 검증 =====")
+	files := filesMatching(archiveDir, func(s string) bool { return strings.HasSuffix(s, ".sha256.txt") })
+	if len(files) == 0 {
+		return errors.New("SHA256 파일이 없습니다")
+	}
+	f := files[selectOne(files, "검증할 SHA256 파일 선택: ")]
+	b, e := os.ReadFile(filepath.Join(archiveDir, f))
+	if e != nil {
+		return e
+	}
+	for _, ln := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		parts := strings.Fields(ln)
+		if len(parts) < 2 {
+			continue
+		}
+		h, e := shaFileWithProgress(filepath.Join(archiveDir, parts[1]))
+		if e != nil {
+			return e
+		}
+		if h != parts[0] {
+			return fmt.Errorf("%s: FAILED", parts[1])
+		}
+		fmt.Println(parts[1] + ": OK")
+	}
+	fmt.Println("✔ Archive SHA256 검증 완료")
+	return nil
+}
+func showMacRsync() {
+	clear()
+	fmt.Println("==========================================================\n  Mac으로 Archive 파일 전송 (rsync 명령어)\n==========================================================\n")
+	fmt.Printf("rsync -avP root@%s:%s/ .\n\n전송 완료 후:\nshasum -a 256 -c *.sha256.txt\n", containerIP, archiveDir)
+}
+func showWorkStatus() error {
+	ensureDirs()
+	clear()
+	fmt.Println("==========================================================\n  /work 스토리지 및 전체 디렉터리 현황\n==========================================================")
+	fmt.Printf("\n여유 공간: %s\nprocessed: %s (파일 %d개)\ntakeout: %s\narchive: %s\n임시 NFC: %s\n", humanBytes(freeBytes(workRoot)), humanBytes(dirSize(processedDir)), fileCount(processedDir), humanBytes(dirSize(takeoutDir)), humanBytes(dirSize(archiveDir)), humanBytes(dirSize(normalizedInputDir)))
+	fmt.Println("\n▶ Takeout ZIP")
+	for _, f := range zipFiles() {
+		st, _ := os.Stat(filepath.Join(takeoutDir, f))
+		fmt.Printf("  %-10s %s\n", humanBytes(st.Size()), f)
+	}
+	fmt.Println("▶ Archive")
+	for _, f := range archiveFiles() {
+		st, _ := os.Stat(filepath.Join(archiveDir, f))
+		fmt.Printf("  %-10s %s\n", humanBytes(st.Size()), f)
+	}
+	return nil
+}
+
+func smtpPassword() string {
+	b, e := os.ReadFile(smtpCredential)
+	if e != nil {
+		return ""
+	}
+	return strings.Join(strings.Fields(string(b)), "")
+}
+func sendEmail(task, status, details string) {
+	if !enableEmailNotify {
+		return
+	}
+	pass := smtpPassword()
+	if pass == "" {
+		fmt.Fprintln(os.Stderr, "⚠ SMTP 인증정보 없음")
+		return
+	}
+	server := strings.TrimPrefix(smtpServer, "smtps://")
+	host, _, _ := strings.Cut(server, ":")
+	conn, e := tls.Dial("tcp", server, &tls.Config{ServerName: host})
+	if e != nil {
+		fmt.Fprintln(os.Stderr, "⚠ 이메일 실패:", e)
+		return
+	}
+	defer conn.Close()
+	c, e := smtp.NewClient(conn, host)
+	if e != nil {
+		return
+	}
+	defer c.Quit()
+	if e = c.Auth(smtp.PlainAuth("", smtpUser, pass, host)); e != nil {
+		return
+	}
+	_ = c.Mail(smtpUser)
+	_ = c.Rcpt(alertTo)
+	w, e := c.Data()
+	if e != nil {
+		return
+	}
+	body := fmt.Sprintf("From: <%s>\r\nTo: <%s>\r\nSubject: [GPTH Server] %s 작업 %s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n[작업 결과 보고]\r\n- 작업 항목 : %s\r\n- 상태      : %s\r\n- 발생 시각 : %s\r\n\r\n%s\r\n", smtpUser, alertTo, task, status, task, status, time.Now().Format("2006-01-02 15:04:05"), details)
+	_, _ = w.Write([]byte(body))
+	_ = w.Close()
+}
+func testSMTP() error {
+	if smtpPassword() == "" {
+		return errors.New("SMTP 앱 비밀번호를 읽지 못했습니다")
+	}
+	fmt.Println("발신 계정 :", smtpUser, "\n수신 대상 :", alertTo, "\n전송 시도 중...")
+	sendEmail("SMTP 연결 테스트", "성공", "이 메일은 Google Photos Archive Toolkit Go 버전에서 보낸 테스트 메일입니다.")
+	fmt.Println("✔ 전송 명령 완료")
+	return nil
+}
