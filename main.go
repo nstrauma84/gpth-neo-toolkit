@@ -403,7 +403,7 @@ func statusLine() {
 	} else {
 		fmt.Printf("GPTH Neo    : %s  ⚠ Latest: %s\n", i, l)
 	}
-	for _, x := range []struct{ n, l string }{{"rclone", "rclone"}, {"rsync", "rsync"}, {"exiftool", "ExifTool"}} {
+	for _, x := range []struct{ n, l string }{{"rclone", "rclone"}, {"rsync", "rsync"}, {"exiftool", "ExifTool"}, {"par2", "PAR2"}} {
 		if existsCmd(x.n) {
 			fmt.Printf("%-12s: installed\n", x.l)
 		} else {
