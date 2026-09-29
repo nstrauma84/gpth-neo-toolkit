@@ -92,7 +92,7 @@ func TestSplitFailureDoesNotHang(t *testing.T) {
 	}
 	t.Setenv("PATH", bin)
 	done := make(chan error, 1)
-	go func() { done <- pipeTar(filepath.Join(t.TempDir(), "parts"), true) }()
+	go func() { done <- pipeTar(filepath.Join(t.TempDir(), "parts"), true, processedDir) }()
 	select {
 	case err := <-done:
 		if err == nil {
