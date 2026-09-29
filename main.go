@@ -872,7 +872,7 @@ func createArchive() error {
 			return err
 		}
 		fmt.Println("[2/2] SHA256 생성...")
-		h, err := shaFile(dst)
+		h, err := shaFileWithProgress(dst)
 		if err != nil {
 			return err
 		}
@@ -918,7 +918,7 @@ func createArchive() error {
 		sort.Strings(parts)
 		var b strings.Builder
 		for _, p := range parts {
-			h, e := shaFile(p)
+			h, e := shaFileWithProgress(p)
 			if e != nil {
 				return e
 			}
