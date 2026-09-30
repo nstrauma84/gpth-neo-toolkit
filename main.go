@@ -112,15 +112,16 @@ func mainMenu() {
 		fmt.Println("r) 기본 rclone remote 변경")
 		fmt.Println("m) Mac으로 Archive 복사 명령어 보기")
 		fmt.Println("e) SMTP 이메일 알림 설정")
-		fmt.Println("7) 종료")
+		fmt.Println("7) 저장공간 용량 정리")
+		fmt.Println("8) 종료")
 		fmt.Print("번호 선택: ")
 		c := readLine()
-		if c == "7" {
+		if c == "8" {
 			fmt.Println("종료합니다.")
 			return
 		}
 
-		valid := map[string]bool{"0": true, "1": true, "2": true, "3": true, "4": true, "5": true, "6": true, "s": true, "m": true}
+		valid := map[string]bool{"0": true, "1": true, "2": true, "3": true, "4": true, "5": true, "6": true, "7": true, "s": true, "m": true}
 		if valid[strings.ToLower(c)] {
 			if err := showStorageStatus(); err != nil {
 				reportTaskError(c, err)
@@ -145,6 +146,8 @@ func mainMenu() {
 			err = retrieveArchive()
 		case "6":
 			err = verifyArchive()
+		case "7":
+			err = cleanupSpace()
 		case "s":
 			err = showWorkStatus()
 		case "m":
@@ -738,8 +741,9 @@ func runGPTH() error {
 	if remain != 0 {
 		return errors.New("비-NFC 이름이 남아 있습니다")
 	}
-	if dirSize(processedDir) > 0 && !confirm("출력 폴더가 비어 있지 않습니다. 이 출력 폴더를 사용해 계속할까요?", false) {
-		return nil
+	runOutDir := filepath.Join(processedDir, time.Now().Format("20060102_150405"))
+	if err := os.MkdirAll(runOutDir, 0755); err != nil {
+		return fmt.Errorf("GPTH 결과 폴더 생성 실패: %w", err)
 	}
 
 	albums, divide := "json", "1"
@@ -763,11 +767,11 @@ func runGPTH() error {
 	}
 	dateDesc := map[string]string{"0": "분류 안 함", "1": "연도별", "2": "연도/월", "3": "연도/월/일"}[divide]
 	fmt.Println("\n===== GPTH Neo 실행 설정 =====")
-	fmt.Printf("Input            : %s\nOutput           : %s\nAlbums           : %s\nDate folders     : %s\nWrite EXIF       : %t\nKeep duplicates  : %t\nKeep input       : %t\nResume           : %t\nLocal timezone   : 미사용\n", normalizedInputDir, processedDir, albums, dateDesc, writeExif, keepDup, keepInput, resume)
+	fmt.Printf("Input            : %s\nOutput           : %s\nAlbums           : %s\nDate folders     : %s\nWrite EXIF       : %t\nKeep duplicates  : %t\nKeep input       : %t\nResume           : %t\nLocal timezone   : 미사용\n", normalizedInputDir, runOutDir, albums, dateDesc, writeExif, keepDup, keepInput, resume)
 	if !confirm("이 설정으로 실행할까요?", true) {
 		return nil
 	}
-	args := []string{"--input", normalizedInputDir, "--output", processedDir, "--albums", albums, "--divide-to-dates", divide}
+	args := []string{"--input", normalizedInputDir, "--output", runOutDir, "--albums", albums, "--divide-to-dates", divide}
 	if writeExif {
 		args = append(args, "--write-exif")
 	} else {
@@ -798,7 +802,7 @@ func runGPTH() error {
 	if err := os.RemoveAll(normalizedInputDir); err != nil {
 		return fmt.Errorf("GPTH 처리 완료 후 임시 입력 삭제 실패: %w", err)
 	}
-	sendEmail("GPTH Neo 사진 정리", "성공", fmt.Sprintf("- 출력 경로: %s\n- Albums: %s\n- Date folders: %s\n- Write EXIF: %t\n- Keep duplicates: %t\n- Keep input: %t\n- Resume: %t\n- 소요 시간: %s", processedDir, albums, dateDesc, writeExif, keepDup, keepInput, resume, formatDuration(time.Since(start))))
+	sendEmail("GPTH Neo 사진 정리", "성공", fmt.Sprintf("- 출력 경로: %s\n- Albums: %s\n- Date folders: %s\n- Write EXIF: %t\n- Keep duplicates: %t\n- Keep input: %t\n- Resume: %t\n- 소요 시간: %s", runOutDir, albums, dateDesc, writeExif, keepDup, keepInput, resume, formatDuration(time.Since(start))))
 	return nil
 }
 
@@ -807,14 +811,50 @@ func createArchive() error {
 	if err := ensureDirs(); err != nil {
 		return err
 	}
-	if dirSize(processedDir) == 0 {
+
+	dirs, err := os.ReadDir(processedDir)
+	if err != nil {
+		return err
+	}
+
+	var processedFolders []string
+	hasFiles := false
+	for _, d := range dirs {
+		if d.IsDir() {
+			processedFolders = append(processedFolders, d.Name())
+		} else {
+			hasFiles = true
+		}
+	}
+
+	if len(processedFolders) == 0 && !hasFiles {
 		return errors.New("처리 결과가 없습니다")
 	}
+
+	var targetDir string
+	if len(processedFolders) > 0 {
+		var menu []string
+		for _, f := range processedFolders {
+			menu = append(menu, f+fmt.Sprintf(" (%s)", humanBytes(dirSize(filepath.Join(processedDir, f)))))
+		}
+		if hasFiles {
+			menu = append(menu, "processed 루트 (이전 방식 결과물)")
+		}
+		selIdx := selectOne(menu, "Archive할 결과 폴더를 선택하세요: ")
+		if selIdx < len(processedFolders) {
+			targetDir = filepath.Join(processedDir, processedFolders[selIdx])
+		} else {
+			targetDir = processedDir
+		}
+	} else {
+		targetDir = processedDir
+	}
+
 	zips, zipErr := zipFiles()
 	if zipErr != nil {
 		return zipErr
 	}
-	proc := dirSize(processedDir)
+	proc := dirSize(targetDir)
 	free := freeBytes(archiveDir)
 	if len(zips) > 0 {
 		zb := sumFiles(takeoutDir, zips)
@@ -868,11 +908,11 @@ func createArchive() error {
 			return err
 		}
 		fmt.Println("[1/2] TAR 생성...")
-		if err := pipeTar(dst, false); err != nil {
+		if err := pipeTar(dst, false, targetDir); err != nil {
 			return err
 		}
 		fmt.Println("[2/2] SHA256 생성...")
-		h, err := shaFile(dst)
+		h, err := shaFileWithProgress(dst)
 		if err != nil {
 			return err
 		}
@@ -904,7 +944,7 @@ func createArchive() error {
 			}
 		}
 		fmt.Println("[1/2] 50GB 분할 TAR 생성...")
-		if err := pipeTar(prefix, true); err != nil {
+		if err := pipeTar(prefix, true, targetDir); err != nil {
 			return err
 		}
 		fmt.Println("[2/2] SHA256 생성...")
@@ -918,7 +958,7 @@ func createArchive() error {
 		sort.Strings(parts)
 		var b strings.Builder
 		for _, p := range parts {
-			h, e := shaFile(p)
+			h, e := shaFileWithProgress(p)
 			if e != nil {
 				return e
 			}
@@ -938,8 +978,8 @@ func createArchive() error {
 	sendEmail("TAR + SHA256 생성", "성공", fmt.Sprintf("- 아카이브 파일명: %s\n- 소요 시간: %s\n- 보관 경로: %s", tarName, formatDuration(time.Since(start)), archiveDir))
 	return nil
 }
-func pipeTar(dest string, split bool) error {
-	tar := exec.Command("tar", "-cf", "-", "-C", filepath.Dir(processedDir), filepath.Base(processedDir))
+func pipeTar(dest string, split bool, targetDir string) error {
+	tar := exec.Command("tar", "-cf", "-", "-C", filepath.Dir(targetDir), filepath.Base(targetDir))
 	tar.Stderr = os.Stderr
 	if !split {
 		f, err := os.Create(dest)
@@ -1246,6 +1286,249 @@ func showWorkStatus() error {
 			return err
 		}
 		fmt.Printf("  %-10s %s\n", humanBytes(st.Size()), f)
+	}
+	return nil
+}
+
+func cleanupSpace() error {
+	for {
+		clear()
+		fmt.Println("===== 저장공간 용량 정리 =====")
+		showStorageStatus()
+		fmt.Println("\n1) Takeout ZIP 그룹 삭제")
+		fmt.Println("2) Processed 결과 폴더 삭제")
+		fmt.Println("3) Archive 그룹 삭제")
+		fmt.Println("0) 돌아가기")
+		fmt.Print("번호 선택: ")
+		c := readLine()
+
+		var err error
+		switch c {
+		case "0", "":
+			return nil
+		case "1":
+			err = cleanupTakeout()
+		case "2":
+			err = cleanupProcessed()
+		case "3":
+			err = cleanupArchive()
+		default:
+			fmt.Println("잘못된 번호입니다.")
+			pause()
+			continue
+		}
+
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "⚠ 정리 중 오류 발생:", err)
+		}
+		pause()
+	}
+}
+
+func cleanupTakeout() error {
+	zips, err := zipFiles()
+	if err != nil {
+		return err
+	}
+	if len(zips) == 0 {
+		fmt.Println("삭제할 ZIP 파일이 없습니다.")
+		return nil
+	}
+
+	groups := make(map[string][]string)
+	re := regexp.MustCompile(`(?i)-[0-9]+\.zip$`)
+	for _, z := range zips {
+		prefix := z
+		if re.MatchString(z) {
+			prefix = re.ReplaceAllString(z, "")
+		}
+		groups[prefix] = append(groups[prefix], z)
+	}
+
+	var prefixes []string
+	for p := range groups {
+		prefixes = append(prefixes, p)
+	}
+	sort.Strings(prefixes)
+
+	var menu []string
+	for _, p := range prefixes {
+		files := groups[p]
+		size := sumFiles(takeoutDir, files)
+		menu = append(menu, fmt.Sprintf("%s (ZIP %d개, %s)", p, len(files), humanBytes(size)))
+	}
+
+	fmt.Println("\n===== Takeout ZIP 그룹 삭제 =====")
+	selIdxs := selectMany(append(menu, "취소"), "삭제할 그룹 선택 (공백 구분, 취소는 마지막 번호): ")
+
+	var toDelete []string
+	for _, i := range selIdxs {
+		if i == len(menu) {
+			return nil
+		}
+		toDelete = append(toDelete, groups[prefixes[i]]...)
+	}
+
+	if len(toDelete) == 0 {
+		return nil
+	}
+
+	fmt.Printf("\n총 %d개의 ZIP 파일을 삭제합니다. (예상 확보 공간: %s)\n", len(toDelete), humanBytes(sumFiles(takeoutDir, toDelete)))
+	if !confirm("정말 삭제하시겠습니까?", false) {
+		return nil
+	}
+
+	for _, f := range toDelete {
+		if err := os.Remove(filepath.Join(takeoutDir, f)); err != nil {
+			fmt.Fprintln(os.Stderr, "⚠ 삭제 실패:", f, err)
+		} else {
+			fmt.Println("✔ 삭제 완료:", f)
+		}
+	}
+	return nil
+}
+
+func cleanupProcessed() error {
+	dirs, err := os.ReadDir(processedDir)
+	if err != nil {
+		return err
+	}
+
+	var folders []string
+	hasRootFiles := false
+	for _, d := range dirs {
+		if d.IsDir() {
+			folders = append(folders, d.Name())
+		} else {
+			hasRootFiles = true
+		}
+	}
+
+	if len(folders) == 0 && !hasRootFiles {
+		fmt.Println("삭제할 Processed 결과가 없습니다.")
+		return nil
+	}
+
+	var menu []string
+	var targets []string
+	for _, f := range folders {
+		targets = append(targets, f)
+		size := dirSize(filepath.Join(processedDir, f))
+		menu = append(menu, fmt.Sprintf("%s (%s)", f, humanBytes(size)))
+	}
+	if hasRootFiles {
+		targets = append(targets, ".")
+		size := dirSize(processedDir) // Rough estimate including folders, but user will get the idea
+		menu = append(menu, fmt.Sprintf("processed 루트의 파일들 (폴더 제외) (루트 전체 크기: %s)", humanBytes(size)))
+	}
+
+	fmt.Println("\n===== Processed 결과 삭제 =====")
+	selIdxs := selectMany(append(menu, "취소"), "삭제할 폴더 선택 (공백 구분, 취소는 마지막 번호): ")
+
+	var toDelete []string
+	for _, i := range selIdxs {
+		if i == len(menu) {
+			return nil
+		}
+		toDelete = append(toDelete, targets[i])
+	}
+
+	if len(toDelete) == 0 {
+		return nil
+	}
+
+	fmt.Println("\n다음 항목을 삭제합니다:")
+	for _, t := range toDelete {
+		fmt.Println("-", t)
+	}
+	if !confirm("정말 삭제하시겠습니까?", false) {
+		return nil
+	}
+
+	for _, t := range toDelete {
+		if t == "." {
+			// Delete files only in root
+			for _, d := range dirs {
+				if !d.IsDir() {
+					os.Remove(filepath.Join(processedDir, d.Name()))
+				}
+			}
+			fmt.Println("✔ 삭제 완료: processed 루트 파일들")
+		} else {
+			if err := os.RemoveAll(filepath.Join(processedDir, t)); err != nil {
+				fmt.Fprintln(os.Stderr, "⚠ 삭제 실패:", t, err)
+			} else {
+				fmt.Println("✔ 삭제 완료:", t)
+			}
+		}
+	}
+	return nil
+}
+
+func cleanupArchive() error {
+	sets, err := verificationSets()
+	if err != nil {
+		return err
+	}
+	if len(sets) == 0 {
+		fmt.Println("삭제할 Archive가 없습니다.")
+		return nil
+	}
+
+	var menu []string
+	for _, set := range sets {
+		var size int64
+		var files []string
+
+		// Find all related files
+		archives, _ := archiveFiles()
+		for _, f := range archives {
+			if strings.HasPrefix(f, set.Base+".tar") || f == set.SHA || strings.HasPrefix(f, set.Base+".vol") || f == set.Base+".par2" {
+				st, _ := os.Stat(filepath.Join(archiveDir, f))
+				if st != nil {
+					size += st.Size()
+					files = append(files, f)
+				}
+			}
+		}
+
+		menu = append(menu, fmt.Sprintf("%s (파일 %d개, %s)", set.Base, len(files), humanBytes(size)))
+	}
+
+	fmt.Println("\n===== Archive 그룹 삭제 =====")
+	selIdxs := selectMany(append(menu, "취소"), "삭제할 그룹 선택 (공백 구분, 취소는 마지막 번호): ")
+
+	var toDeleteSets []archiveSet
+	for _, i := range selIdxs {
+		if i == len(menu) {
+			return nil
+		}
+		toDeleteSets = append(toDeleteSets, sets[i])
+	}
+
+	if len(toDeleteSets) == 0 {
+		return nil
+	}
+
+	fmt.Println("\n다음 Archive 그룹에 관련된 모든 파일을 삭제합니다:")
+	for _, set := range toDeleteSets {
+		fmt.Println("-", set.Base)
+	}
+	if !confirm("정말 삭제하시겠습니까?", false) {
+		return nil
+	}
+
+	for _, set := range toDeleteSets {
+		archives, _ := archiveFiles()
+		for _, f := range archives {
+			if strings.HasPrefix(f, set.Base+".tar") || f == set.SHA || strings.HasPrefix(f, set.Base+".vol") || f == set.Base+".par2" {
+				if err := os.Remove(filepath.Join(archiveDir, f)); err != nil {
+					fmt.Fprintln(os.Stderr, "⚠ 삭제 실패:", f, err)
+				} else {
+					fmt.Println("✔ 삭제 완료:", f)
+				}
+			}
+		}
 	}
 	return nil
 }
